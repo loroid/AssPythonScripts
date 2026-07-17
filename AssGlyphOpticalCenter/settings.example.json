@@ -1,0 +1,44 @@
+{
+  "inputs": [],
+  "output": null,
+  "output_dir": null,
+  "in_place": false,
+  "recursive": false,
+  "overwrite": false,
+  "dry_run": false,
+  "list_styles": false,
+
+  "style_rules": {
+    "match": [
+      "CHS"
+    ],
+    "match_exact": [
+      "Japanese"
+    ],
+    "exclude": [
+      "Note"
+    ],
+    "exclude_exact": [
+      "CHS Sign"
+    ],
+    "ignore_case": false
+  },
+
+  "mode": "margin",
+  "threshold": 0.2,
+  "large_margin_threshold": 100,
+  "preserve_large_margins": true,
+
+  "ruby_style_rules": {
+    "match": [],
+    "match_exact": [
+      "Text - Ruby"
+    ]
+  },
+  "ruby_distance_threshold_percent": 3,
+
+  "process_comments": false,
+  "debug_clip": false,
+
+  "font_dirs": []
+}
