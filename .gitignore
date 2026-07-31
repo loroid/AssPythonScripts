@@ -5,6 +5,14 @@ __pycache__/
 .DS_Store
 Thumbs.db
 
+# Local development assets for AssCleanRedundantTags are not release files.
+.development/
+AssCleanRedundantTags/ass_clean_redundant_tags.config.json
+AssCleanRedundantTags/differential_report.md
+AssCleanRedundantTags/*.ass
+AssCleanRedundantTags/*.ssa
+AssCleanRedundantTags/*.html
+
 # Local subtitle inputs and generated reports used while developing this tool.
 AssFontFamilyNormalize/*.ass
 AssFontFamilyNormalize/family output/

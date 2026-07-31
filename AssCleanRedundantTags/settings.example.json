@@ -1,0 +1,38 @@
+{
+  "inputs": [],
+  "output": null,
+  "output_dir": null,
+  "in_place": false,
+  "backup": true,
+  "recursive": false,
+
+  "safe_reorder": true,
+  "merge_lines": true,
+  "clean_comments": false,
+  "clean_unknown_tags": true,
+
+  "clean_extradata_references": true,
+  "clean_project_garbage": true,
+  "clean_extradata": true,
+
+  "report": null,
+  "report_dir": null,
+  "write_reports": true,
+  "report_format": "html",
+
+  "compare_libass": true,
+  "compare_vsfilter": false,
+  "ffmpeg": "ffmpeg",
+  "xy_vsfilter_dll": null,
+  "xy_adapter": null,
+  "fps": "24000/1001",
+  "backgrounds": [
+    "black",
+    "white"
+  ],
+  "allow_partial": false,
+  "channel_tolerance": 0,
+  "pixel_tolerance": 0,
+  "timeout": 30.0,
+  "render_workers": 4
+}
