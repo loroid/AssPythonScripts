@@ -307,10 +307,10 @@ When a Style reset and a transform occur together, the active Style is switched 
 This becomes:
 
 ```ass
-{\rAlt\fscx80\t(0,500,\fscx160)}A
+{\rAlt\t(0,500,\fscx160)}A
 ```
 
-`\fscy100`, `\b1`, `\c&HFF0000&`, and `\shad1` are already supplied by Style `Alt`. Although `\fscx80` also matches the Style, it is retained because the later scale animation depends on it as a static starting value.
+`\fscx80`, `\fscy100`, `\b1`, `\c&HFF0000&`, and `\shad1` are all supplied by Style `Alt`. After `\fscx80` is removed, the scale animation still starts from the active Style's `ScaleX=80`, so that tag is redundant as well.
 
 With repeated writes across rendering boundaries and two Style changes:
 
@@ -387,20 +387,44 @@ Simple `\t` expressions are analyzed field by field:
 
 - Identity transforms can be removed
 - A valid transform entirely after the event end can be removed
-- Fields modified by a transform protect their corresponding static starting state
+- Fields modified by a transform protect static state that actually changes the animation start; a preceding write equal to the current effective state can still be removed
 - Static redundant tags unrelated to transform fields can still be removed independently
 - Nested transforms, complex parenthesized content, and relative font-size animation are not semantically deleted field by field; independently recognizable numbers are still normalized, and unknown modifiers are removed only when `--clean-unknown-tags` is enabled and the content can be split safely
 
-This allows `\fscy100` to be removed here:
+Assume the active Style has `ScaleX=100` and `ScaleY=100`. If a transform still targets the current value of 100, the effective value never changes before, during, or after interpolation, so the entire identity transform can be removed:
+
+```ass
+{\t(0,500,\fscx100)}Text
+```
+
+This becomes:
+
+```ass
+Text
+```
+
+`\fscy100` is unrelated to the following transform and can also be removed:
 
 ```ass
 {\fscy100\t(\fscx200)}Text
 ```
 
-but `\fscx100` must remain here because it defines the animation starting value:
+Although `\fscx100` targets the same field as the transform, it equals the value already supplied by the Style. Removing it leaves the animation start at 100, so it can also be removed:
 
 ```ass
 {\fscx100\t(0,500,\fscx200)}Text
+```
+
+The result is:
+
+```ass
+{\t(0,500,\fscx200)}Text
+```
+
+If the static value is `\fscx80`, it changes the animation start from the Style's 100 to 80 and must remain:
+
+```ass
+{\fscx80\t(0,500,\fscx200)}Text
 ```
 
 ### Complex transform examples
@@ -414,10 +438,10 @@ When multiple transforms modify different fields, their dependencies are combine
 This becomes:
 
 ```ass
-{\fscx100\fscy100\bord2\t(0,500,\fscx200\bord4)\t(500,1000,\fscy150)}A
+{\t(0,500,\fscx200\bord4)\t(500,1000,\fscy150)}A
 ```
 
-The two transforms depend on static ScaleX, ScaleY, and border starting values, so those three Style-equivalent tags stay. Shadow, color, and alpha are unrelated to the animations and can be removed. Numeric values inside both transforms are normalized independently.
+`\fscx100`, `\fscy100`, and `\bord2` correspond to animated fields, but each equals the starting value already supplied by the active Style. Removing them leaves transform interpolation unchanged. Shadow, color, and alpha also match the Style and are unrelated to the animations, so they are removed; numeric values inside both transforms are normalized independently.
 
 A parseable transform may coexist with a complex one. Assume an event duration of `1000 ms` and Style `Alt` from the earlier example:
 
@@ -428,10 +452,10 @@ A parseable transform may coexist with a complex one. Assume an event duration o
 This becomes:
 
 ```ass
-{\rAlt\fs40\fscx80\fscy100\bord3\t(0,500,\fs+10\fscy150)\shad1}A
+{\rAlt\t(0,500,\fs+10\fscy150)\shad1}A
 ```
 
-The first transform begins at the event end and cannot affect an active frame, so it is removed. The second uses relative `\fs+10`, which depends on the current font size. Its independently recognizable values are normalized, while the animation and surrounding state remain a conservative semantic boundary.
+The first transform begins at the event end and cannot affect an active frame, so it is removed. The second uses relative `\fs+10`, which depends on the current font size. The preceding `\fs40`, `\fscx80`, `\fscy100`, and `\bord3` equal Style `Alt` and can be removed without changing the animation start. The `\shad1` after the complex transform remains inside a conservative boundary and is retained.
 
 ## Compatibility-safe reordering
 

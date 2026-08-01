@@ -313,10 +313,10 @@ Style reset 与 transform 同时出现时，程序先切换活动 Style，再按
 清理为：
 
 ```ass
-{\rAlt\fscx80\t(0,500,\fscx160)}A
+{\rAlt\t(0,500,\fscx160)}A
 ```
 
-`\fscy100`、`\b1`、`\c&HFF0000&` 和 `\shad1` 已由 `Alt` Style 提供；`\fscx80` 虽与 Style 相同，却是后续缩放动画依赖的静态起始字段，因此保留。
+`\fscx80`、`\fscy100`、`\b1`、`\c&HFF0000&` 和 `\shad1` 均已由 `Alt` Style 提供。删除 `\fscx80` 后，缩放动画仍从活动 Style 的 `ScaleX=80` 开始，因此它也是冗余的。
 
 跨越多个显示边界、重复写入并两次切换 Style 时：
 
@@ -393,20 +393,44 @@ m 100 100 l 200 200
 
 - identity transform 可以删除
 - 完全落在事件结束时间之后的有效 transform 可以删除
-- transform 修改的字段会保护对应静态起始状态
+- transform 修改的字段会保护真正改变动画起点的静态状态；transform 之前与当前有效状态相同的写入仍可删除
 - 与 transform 字段无关的静态冗余标签仍可独立删除
 - 嵌套 transform、复杂括号内容和相对字号动画不做字段级语义删除；其中能够独立识别的数值仍会规范化，未知 modifier 仅在启用 `--clean-unknown-tags` 且能够安全拆分时删除
 
-这使下面的 `\fscy100` 可以删除：
+假设活动 Style 的 `ScaleX=100`、`ScaleY=100`。如果 transform 的目标值仍为当前的 100，动画前后及插值期间的有效值都不发生变化，整个 identity transform 可以删除：
+
+```ass
+{\t(0,500,\fscx100)}Text
+```
+
+清理为：
+
+```ass
+Text
+```
+
+下面的 `\fscy100` 与 transform 无关，也可以删除：
 
 ```ass
 {\fscy100\t(\fscx200)}Text
 ```
 
-但下面的 `\fscx100` 必须保留，因为它定义动画起点：
+下面的 `\fscx100` 虽然与 transform 修改同一字段，但它等于 Style 提供的当前值，删除后动画起点仍为 100，因此也可以删除：
 
 ```ass
 {\fscx100\t(0,500,\fscx200)}Text
+```
+
+清理为：
+
+```ass
+{\t(0,500,\fscx200)}Text
+```
+
+如果静态值改为 `\fscx80`，它会把动画起点从 Style 的 100 改为 80，此时必须保留：
+
+```ass
+{\fscx80\t(0,500,\fscx200)}Text
 ```
 
 ### 复杂 transform 案例
@@ -420,10 +444,10 @@ m 100 100 l 200 200
 清理为：
 
 ```ass
-{\fscx100\fscy100\bord2\t(0,500,\fscx200\bord4)\t(500,1000,\fscy150)}A
+{\t(0,500,\fscx200\bord4)\t(500,1000,\fscy150)}A
 ```
 
-两个 transform 分别依赖 `ScaleX`、`ScaleY` 和描边的静态起点，因此三个等于 Style 的起始标签仍需保留；与动画字段无关且等于 Style 的阴影、颜色和透明度可以删除，transform 内的数值则可独立规范化。
+`\fscx100`、`\fscy100` 和 `\bord2` 虽对应动画字段，但都等于活动 Style 已提供的起点，删除后 transform 的插值起点不变。阴影、颜色和透明度同样等于 Style 且与动画无关，因此也会删除；transform 内的数值则独立规范化。
 
 可解析 transform 与复杂 transform 并存时，程序只处理能够独立证明安全的部分。假设事件时长为 `1000 ms`，并沿用上文的 `Alt` Style：
 
@@ -434,10 +458,10 @@ m 100 100 l 200 200
 清理为：
 
 ```ass
-{\rAlt\fs40\fscx80\fscy100\bord3\t(0,500,\fs+10\fscy150)\shad1}A
+{\rAlt\t(0,500,\fs+10\fscy150)\shad1}A
 ```
 
-第一个 transform 从事件结束时才开始，不会作用于任何生效帧，因此可以删除。第二个 transform 使用依赖当前字号的相对字号动画 `\fs+10`；程序会规范化其中可独立处理的数值，但把这段动画及其周围状态视为保守边界，不继续删除看似等于 Style 的标签。
+第一个 transform 从事件结束时才开始，不会作用于任何生效帧，因此可以删除。第二个 transform 使用依赖当前字号的相对字号动画 `\fs+10`；它之前的 `\fs40`、`\fscx80`、`\fscy100` 和 `\bord3` 都等于 `Alt` Style，可在不改变动画起点的前提下删除。复杂 transform 之后的 `\shad1` 仍位于保守边界内，因此保留。
 
 ## 兼容安全重排
 

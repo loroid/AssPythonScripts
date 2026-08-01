@@ -1478,15 +1478,19 @@ def remove_identity_transforms(
                 apply_action(state, action)
 
 
-def collect_transform_fields(
+def collect_transform_analysis(
     parts: list[TextPart],
     initial: dict[str, str],
     styles: dict[str, AssStyle],
     original_style: str,
     wrap_style: int,
     event_duration_ms: int | None,
-) -> set[str] | None:
+) -> tuple[set[str] | None, dict[TagPiece, set[str] | None]]:
     fields: set[str] = set()
+    all_fields_known = True
+    preceding_fields: set[str] = set()
+    preceding_fields_known = True
+    preceding_by_piece: dict[TagPiece, set[str] | None] = {}
     state = dict(initial)
     for part in parts:
         if part.kind != "block" or not part.is_override:
@@ -1504,13 +1508,20 @@ def collect_transform_fields(
                     event_duration_ms,
                 )
                 if nested is None:
-                    return None
-                fields.update(nested)
+                    all_fields_known = False
+                    preceding_fields_known = False
+                else:
+                    fields.update(nested)
+                    if preceding_fields_known:
+                        preceding_fields.update(nested)
                 continue
+            preceding_by_piece[piece] = (
+                set(preceding_fields) if preceding_fields_known else None
+            )
             action = action_for_piece(piece, state, styles, original_style, wrap_style)
             if action.valid:
                 apply_action(state, action)
-    return fields
+    return (fields if all_fields_known else None), preceding_by_piece
 
 
 def raw_empty_reset(piece: TagPiece) -> bool:
@@ -1524,6 +1535,7 @@ def process_override_group(
     original_style: str,
     wrap_style: int,
     protected_fields: set[str] | None,
+    preceding_transform_fields: dict[TagPiece, set[str] | None],
     has_following_text: bool,
     stats: TextCleanStats,
 ) -> dict[str, str]:
@@ -1542,7 +1554,11 @@ def process_override_group(
             if not action.valid:
                 continue
             protected = protected_fields is None or bool(set(action.fields) & protected_fields)
-            may_remove_noop = not protected and (
+            preceding = preceding_transform_fields.get(piece)
+            blocked_by_preceding_transform = preceding is None or bool(
+                set(action.fields) & preceding
+            )
+            may_remove_noop = not blocked_by_preceding_transform and (
                 piece.name in STATIC_TAG_FIELDS
                 or piece.name in ("q", "p", "pbo")
             )
@@ -1845,7 +1861,7 @@ def clean_ass_text(
         event_duration_ms,
         stats,
     )
-    protected_fields = collect_transform_fields(
+    protected_fields, preceding_transform_fields = collect_transform_analysis(
         parts,
         initial,
         styles,
@@ -1876,6 +1892,7 @@ def clean_ass_text(
             style_name,
             wrap_style,
             protected_fields,
+            preceding_transform_fields,
             has_following_text,
             stats,
         )
@@ -2895,7 +2912,7 @@ def avisynth_background(name: str) -> str:
 
 
 class LibassFfmpegRenderer(Renderer):
-    name = "libass（FFmpeg ass filter）"
+    name = "libass (FFmpeg ass filter)"
 
     def __init__(self, ffmpeg: str, timeout: float) -> None:
         self.ffmpeg = ffmpeg
@@ -2963,9 +2980,9 @@ class LibassFfmpegRenderer(Renderer):
             api_match = re.search(r"libass API version:\s*(0x[0-9A-Fa-f]+)", output)
             source_match = re.search(r"libass source:\s*([^\r\n]+)", output)
             if api_match:
-                detail += "；libass API " + api_match.group(1)
+                detail += "; libass API " + api_match.group(1)
             if source_match:
-                detail += "；" + source_match.group(1).strip()
+                detail += "; " + source_match.group(1).strip()
             if probe.returncode != 0 or not api_match:
                 detail += "; libass API version could not be read"
         except OSError as exc:
@@ -3109,7 +3126,7 @@ def avisynth_string(value: Path) -> str:
 
 
 class AviSynthVsFilterRenderer(Renderer):
-    name = "xy-VSFilter（AviSynth TextSub）"
+    name = "xy-VSFilter (AviSynth TextSub)"
 
     def __init__(self, ffmpeg: str, plugin: Path, timeout: float) -> None:
         self.ffmpeg = ffmpeg
@@ -3126,7 +3143,7 @@ class AviSynthVsFilterRenderer(Renderer):
         demuxers = run_command([self._resolved, "-hide_banner", "-demuxers"], self.timeout)
         if demuxers.returncode != 0 or "avisynth" not in demuxers.stdout.lower():
             return False, "This FFmpeg build has no AviSynth demuxer"
-        return True, "TextSub plugin：%s" % self.plugin.resolve()
+        return True, "TextSub plugin: %s" % self.plugin.resolve()
 
     def render(
         self,
@@ -5273,7 +5290,7 @@ def run_clean_batch_namespace(
                 ) -> None:
                     outer_progress(
                         item_start + item_span * percent / 100.0,
-                        "[%d/%d] %s：%s"
+                        "[%d/%d] %s: %s"
                         % (item_index + 1, total, item_name, message),
                     )
 
@@ -5807,7 +5824,7 @@ def launch_gui() -> int:
                 errors = [item for item in batch.items if item.error]
                 if errors:
                     message += "\n\nErrors:\n" + "\n".join(
-                        "%s：%s" % (item.input_path.name, item.error)
+                        "%s: %s" % (item.input_path.name, item.error)
                         for item in errors[:5]
                     )
                     if len(errors) > 5:
