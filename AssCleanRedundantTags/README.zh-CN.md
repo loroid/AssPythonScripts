@@ -487,11 +487,17 @@ Text
 
 - 两个标签在 libass 与 xy‑VSFilter 下都能被完整解析
 - 完整读写字段集合不相交
-- first-wins、reset、drawing、karaoke 和 transform 依赖不被破坏
+- first-wins、reset、drawing、karaoke 时间线和 transform 依赖不被破坏
 - 不跨越仍保留的未知标签、普通 comment、畸形参数或复杂表达式
-- `\clip` / `\iclip` 不跨越修改 clip 的 transform，也不重排重复 clip 族
+- `\clip` / `\iclip` 仅在简单 transform 的已解析 modifier 字段不包含 clip 时跨越它；重复 clip 族仍不重排
 
 因此较长的 vector clip 会尽量移到局部可交换片段末尾，但不会穿过无法证明安全的边界。
+
+在同一个 override block 内，karaoke 标签可以跨越静态样式标签、`\r`、`\p`/`\pbo` 和能够完整解析的简单 `\t`，以达到上面的顺序；libass 与 xy‑VSFilter 在这些写法下会保持相同的音节时间线，并使用相同的最终静态或动画状态。karaoke 标签之间仍保持原始顺序，也不会跨越不透明或复杂的 transform。
+
+确定性的 Style 写入不会仅因字段名重叠就一律停止。重排器会模拟交换前后的完整状态，只有结果完全相同才允许交换。因此，不同值的 reset、全局与单通道透明度、复合与单轴描边/阴影，以及 `\fsc` 与显式轴向缩放，在交换会改变有效状态时仍保持原始顺序。
+
+未文档化的 `\fsc` 兼容重置始终不会跨越 `\r`：即使两种顺序推导出的活动 Style 最终状态看似相同，xy‑VSFilter 的真实输出像素仍会不同。
 
 例如：
 

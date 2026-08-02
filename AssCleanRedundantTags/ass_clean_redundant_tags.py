@@ -1709,14 +1709,55 @@ def reorder_descriptor(
     if not action.valid:
         return None
     if name == "r":
-        fields = ("animation_epoch", "karaoke_timeline") + STYLE_STATE_FIELDS
+        # Both target renderers keep the already parsed karaoke timeline when
+        # a reset and a karaoke tag exchange positions inside one override
+        # block. The reset still conflicts with transforms and Style fields.
+        fields = ("animation_epoch",) + STYLE_STATE_FIELDS
     elif name in KARAOKE_FIELDS:
-        fields = KARAOKE_FIELDS[name]
+        # Within one override block, both target renderers apply the final
+        # static color/alpha/outline state to the syllable regardless of
+        # whether that static tag appears immediately before or after the
+        # karaoke tag. Keep only the true sequencing dependencies here.
+        fields = ("karaoke_timeline",)
     else:
         fields = action.fields
     if not fields:
         return None
     return SAFE_REORDER_RANK[name], tuple(fields)
+
+
+def deterministic_reorder_actions_commute(
+    left: TagPiece,
+    right: TagPiece,
+    state: dict[str, str],
+    styles: dict[str, AssStyle],
+    original_style: str,
+    wrap_style: int,
+) -> bool:
+    """Prove equality for overlapping deterministic Style-state writes."""
+    allowed = set(STATIC_TAG_FIELDS) | {"r"}
+    if left.name not in allowed or right.name not in allowed:
+        return False
+    # xy-VSFilter does not model the undocumented \fsc compatibility reset
+    # across \r like the abstract active-Style state below. Real rendering
+    # differs even when both simulated end states are identical.
+    if {left.name, right.name} == {"fsc", "r"}:
+        return False
+
+    def result(order: tuple[TagPiece, TagPiece]) -> dict[str, str] | None:
+        trial = dict(state)
+        for piece in order:
+            action = action_for_piece(
+                piece, trial, styles, original_style, wrap_style
+            )
+            if not action.valid or not action.values:
+                return None
+            apply_action(trial, action)
+        return trial
+
+    original = result((left, right))
+    swapped = result((right, left))
+    return original is not None and original == swapped
 
 
 def safely_reorder_block(
@@ -1765,10 +1806,16 @@ def safely_reorder_block(
                 left_descriptor
                 and right_descriptor
                 and right_descriptor[0] < left_descriptor[0]
-                and not (set(left_descriptor[1]) & set(right_descriptor[1]))
-                and not (
-                    (left.name in ("clip", "iclip") and right.name == "t")
-                    or (right.name in ("clip", "iclip") and left.name == "t")
+                and (
+                    not (set(left_descriptor[1]) & set(right_descriptor[1]))
+                    or deterministic_reorder_actions_commute(
+                        left,
+                        right,
+                        prefix_state,
+                        styles,
+                        original_style,
+                        wrap_style,
+                    )
                 )
             )
             if may_swap:

@@ -481,11 +481,17 @@ This is not an unconditional sort. Two adjacent tags can exchange positions only
 
 - Both tags are fully parseable by libass and xy-VSFilter
 - Their complete read/write field sets do not intersect
-- First-wins, reset, drawing, karaoke, and transform dependencies remain intact
+- First-wins, reset, drawing, karaoke-timeline, and transform dependencies remain intact
 - They do not cross a retained unknown tag, brace comment, malformed argument, or complex expression
-- `\clip` / `\iclip` do not cross a transform that modifies clipping, and duplicate clip-family tags are not reordered
+- `\clip` / `\iclip` cross a simple transform only when its parsed modifier fields do not include clipping; duplicate clip-family tags are not reordered
 
 Long vector clips therefore move toward the end of a locally commutative segment when safe, but never cross a boundary whose equivalence cannot be proven.
+
+Within one override block, karaoke may cross static Style tags, `\r`, `\p`/`\pbo`, and a fully parsed simple `\t` to reach the order above. libass and xy-VSFilter preserve the same syllable timeline and use the same final static or animated state in these spellings. Karaoke tags still keep their order relative to other karaoke tags and do not cross an opaque or complex transform.
+
+Overlapping deterministic Style writes are not rejected solely because their field names intersect. The reorderer simulates both orders and permits the exchange only when the complete resulting state is identical. Different reset values, global versus channel alpha, compound versus axis border/shadow, and `\fsc` versus explicit axis scaling therefore remain ordered whenever swapping would change effective state.
+
+The undocumented `\fsc` compatibility reset never crosses `\r`: xy-VSFilter produces different pixels for the two orders even when their abstract active-Style end state appears identical.
 
 For example:
 
