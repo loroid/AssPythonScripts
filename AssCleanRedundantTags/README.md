@@ -6,7 +6,7 @@
 
 [View script](ass_clean_redundant_tags.py)
 
-Cleans ASS/SSA override tags that do not change the effective state, writes that are completely superseded before any text is rendered, and insignificant numeric formatting. It can also apply compatibility-safe tag reordering, merge consecutive identical static Dialogue rows, clean Aegisub file-level metadata, generate audit reports, and validate the before/after output independently with libass and xy-VSFilter.
+Cleans ASS/SSA override tags that do not change the effective state, writes that are completely superseded before any text is rendered, and insignificant numeric formatting. It can optionally remove collision-safe Dialogue rows that remain fully transparent, apply compatibility-safe tag reordering, merge consecutive identical static Dialogue rows, clean Aegisub file-level metadata, generate audit reports, and validate the before/after output independently with libass and xy-VSFilter.
 
 > **Scope:** Supports single files, multiple files, and directory batches. The safety target is to preserve the effective tag state of libass and xy-VSFilter independently. The two renderers are not expected to produce identical images, and syntax that cannot be proven safe is retained.
 
@@ -45,7 +45,7 @@ python ass_clean_redundant_tags.py
 1. Run the script without arguments to open the GUI. When arguments are supplied, cleanup is the default command; `clean` may also be written explicitly.
 2. Add one or more ASS/SSA files or directories, and enable recursive scanning if needed.
 3. Choose a separate output, an output directory, or in-place replacement.
-4. Select tag reordering, line merging, Comment-row removal, unknown-tag cleanup, and Aegisub metadata cleanup as needed.
+4. Select tag reordering, line merging, Comment-row removal, always-transparent Dialogue-row removal, unknown-tag cleanup, and Aegisub metadata cleanup as needed.
 5. Select Markdown or HTML when an audit report is required.
 6. Enable libass, xy-VSFilter, or both for actual rendering validation, and set the render concurrency limit.
 
@@ -69,6 +69,7 @@ python ass_clean_redundant_tags.py [clean] <input files or directories> [options
 | Compatibility-safe reorder | `--safe-reorder` |
 | Merge consecutive identical rows | `--merge-lines` |
 | Remove Comment event rows | `--clean-comments`; disabled by default |
+| Remove always-transparent Dialogue rows | `--remove-transparent-dialogues`; disabled by default |
 | Remove tags unknown to both renderers | `--clean-unknown-tags` |
 | Remove extradata references | `--clean-extradata-references` |
 | Remove Project Garbage | `--clean-project-garbage` |
@@ -133,6 +134,7 @@ The GUI provides independent controls for:
 - Compatibility-safe tag reordering
 - Merging consecutive identical static Dialogue rows
 - Removing Comment event rows from `[Events]`
+- Removing collision-safe Dialogue rows that remain fully transparent
 - Removing override tags unknown to both libass and xy-VSFilter
 - Removing leading `{=number}` extradata references
 - Removing `[Aegisub Project Garbage]`
@@ -212,7 +214,7 @@ A relative output directory does not depend on the process working directory. It
 
 ### Cleanup-option examples
 
-Compatibility-safe reordering, consecutive-line merging, removal of override tags unknown to both renderers, HTML reports, all three Aegisub metadata cleanup operations, and libass comparison are enabled by default. xy-VSFilter comparison is disabled by default:
+Compatibility-safe reordering, consecutive-line merging, removal of override tags unknown to both renderers, HTML reports, all three Aegisub metadata cleanup operations, and libass comparison are enabled by default. Comment-row removal, always-transparent Dialogue-row removal, and xy-VSFilter comparison are disabled by default:
 
 ```powershell
 python ass_clean_redundant_tags.py clean "input.ass"
@@ -247,6 +249,24 @@ In-place replacement creates `input.ass.bak` by default. If that name exists, `i
 ## Tag cleanup rules
 
 The program tracks effective state from the initial Style and the order in which text is rendered. It does not perform simple string deduplication.
+
+### Cleanup quick reference
+
+| Situation | Tags or syntax | Removed when | Retained when |
+| --- | --- | --- | --- |
+| Equal to the current effective state | `\fn`, `\fs`, `\fsp`, `\b`, `\i`, `\u`, `\s`, scale/rotation/shear, border/shadow/blur, `\c`/`\1c`–`\4c`, `\alpha`/`\1a`–`\4a`, `\q`, `\p`, `\pbo`, `\fe` | The parsed value already equals the active Style or preceding effective state, with no relevant transform dependency | The tag restores a value after visible text, changes the active state, or supplies a transform start field |
+| Superseded before the same rendering boundary | Static Style-state tags such as `\fs`, `\fscx`, `\c`, `\alpha`, `\bord`, `\shad` | A later deterministic write completely replaces every field written by the earlier tag before any text uses it | Text occurs between the writes, only part of a compound field is replaced, or a transform may read the earlier value |
+| Color channel fully transparent | `\c`/`\1c`, `\2c`, `\3c`, `\4c` | The corresponding `\alpha` or `\1a`–`\4a` value is provably `&HFF&` for the color write's complete lifetime | Opacity returns before replacement/reset, or a transform may modify that channel's color or alpha |
+| Entire Dialogue row always transparent | The complete Dialogue event | `remove_transparent_dialogues` is enabled, all four channels are provably `&HFF&` at every rendered text/drawing span, no alpha transform can restore visibility, and deleting the event cannot alter collision placement | The option is disabled, any span can become visible, syntax is opaque, or an unpositioned same-layer collision group also contains a visible event |
+| First-wins line property | `\pos`/`\move`, `\org`, `\fad`/`\fade`, `\an`/`\a` | A later valid tag belongs to a family whose first valid occurrence already determines the line; a first alignment equal to Style can also disappear | The first effective geometry/fade tag remains; malformed forms create a conservative boundary |
+| Repeated Style reset | `\r`, `\rStyleName` | The same reset target repeats before text and the later reset changes no effective field | The reset selects a different Style, clears intervening changes, or occurs after rendered text |
+| Identity or temporally inactive transform | `\t(...)` | All parsed modifiers leave their fields unchanged, the modifier list becomes empty, or the transform starts at/after the event end | A modifier changes state, defines animation from a required start value, is nested/opaque, or cannot be fully parsed |
+| Unknown to both target renderers | Unknown override tags, including safely separable modifiers inside `\t` | `clean_unknown_tags` is enabled and the token is confirmed outside both compatibility sets | Either renderer supports it, or its syntax/location cannot be isolated safely |
+| Karaoke timing | `\k`, `\K`, `\kf`, `\ko`, `\kt` | Not removed merely because the numeric value looks ineffective | Preserved as timing/interpretation state; values may still be normalized and tags may be compatibility-safely reordered |
+| Clip and drawing data | `\clip`, `\iclip`, `\p` drawing paths | Redundant numeric zeroes and drawing token spelling are normalized; an unused clip is not deleted solely from geometry guesses | Clip semantics or drawing visibility cannot be proved from static field equality |
+| Override blocks emptied by cleanup or adjacent override blocks | `{\redundant}`, `{\tag1}{\tag2}` | A block is removed after all of its override tags are deleted; adjacent parseable blocks are merged when no conservative boundary lies between them | Literal comments, malformed content, renderer-specific HTML state, or other opaque content keeps the block or boundary |
+
+“Removed” in this table always means that libass and xy-VSFilter keep their respective effective tag state. It does not mean that every textual duplicate is deleted.
 
 If the Style has `ScaleX=100`:
 
@@ -325,6 +345,46 @@ the result is:
 ```
 
 The first `\blur200` and `\fscx60` affect already rendered text and cannot be removed because the same value appears later. Both resets are also required because they select the Style used by `C` and `D`. Only writes that truly have no remaining effect in the current state are removed.
+
+### Fully transparent color channels
+
+A `\c` / `\1c`–`\4c` write is removed when its corresponding `\alpha` or `\1a`–`\4a` channel is provably `&HFF&` for the write's complete lifetime. The analysis follows later text, channel-alpha overrides, replacement colors, and `\r` instead of looking only inside one override block. For example:
+
+```ass
+{\1a&HFF&\1c&H112233&}A{\1c&H445566&\1a&H00&}B
+```
+
+becomes:
+
+```ass
+{\1a&HFF&}A{\1c&H445566&\1a&H00&}B
+```
+
+The first color is invisible while active and is replaced before primary opacity returns. Without that replacement, the color must remain because it becomes visible on `B`:
+
+```ass
+{\1a&HFF&\1c&H112233&}A{\1a&H00&}B
+```
+
+The four channels are analyzed independently. A transform that may modify the channel's color or alpha protects it; a fully parsed transform affecting only unrelated fields does not. Line fades cannot make a statically `&HFF&` channel visible. Malformed syntax, an opaque transform, or an unknown transform field disables this optimization conservatively.
+
+### Always-transparent Dialogue rows
+
+This feature is disabled by default. Enable **Remove always-transparent Dialogue rows when collision-safe** in the GUI, set `"remove_transparent_dialogues": true` in JSON, or use:
+
+```powershell
+python ass_clean_redundant_tags.py clean "input.ass" --remove-transparent-dialogues
+```
+
+When enabled, a complete Dialogue row is removed only if every rendered text or drawing span is provably fully transparent in all four channels. `\alpha&HFF&` and four equivalent `\1a`–`\4a` writes are both recognized; later overrides, `\r`, and alpha transforms are followed before making the decision.
+
+Invisible events can still occupy a collision box. In both libass and xy-VSFilter, an unpositioned transparent event placed before an overlapping visible event on the same layer can move the visible subtitle. The cleaner therefore removes an always-transparent row only when one of these layout conditions is also proven:
+
+- The event has an effective `\pos` or `\move`, so it does not participate in normal collision placement.
+- Its complete same-layer, unpositioned, time-overlapping collision component contains only always-transparent events.
+- No same-layer unpositioned event overlaps it, which is the single-event form of the previous rule.
+
+An overlapping visible event on another layer does not block removal. A same-layer visible event in the collision component does block removal even though the candidate row itself produces no pixels. Unknown or malformed syntax, renderer-specific HTML state, and any transform that may modify `\alpha` or `\1a`–`\4a` also keep the row.
 
 Brace comments, malformed arguments, unparseable blocks, and renderer-specific HTML state form conservative boundaries.
 
@@ -700,6 +760,7 @@ python ass_clean_redundant_tags.py clean --settings settings.json
 | `safe_reorder` | Apply compatibility-safe reordering |
 | `merge_lines` | Merge consecutive identical static Dialogue rows |
 | `clean_comments` | Remove Comment event rows from `[Events]`; default: `false` |
+| `remove_transparent_dialogues` | Remove always-transparent Dialogue rows when collision-safe; default: `false` |
 | `clean_unknown_tags` | Remove tags unknown to both libass and xy-VSFilter; default: `true` |
 | `clean_extradata_references` | Remove leading event extradata references |
 | `clean_project_garbage` | Remove `[Aegisub Project Garbage]` |

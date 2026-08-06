@@ -33,7 +33,7 @@ import traceback
 from typing import Any, Callable, Iterable, Iterator, Sequence
 
 
-VERSION = "1.0"
+VERSION = "1.1"
 EXIT_PASS = 0
 EXIT_DIFFERENCE = 1
 EXIT_INCOMPLETE = 2
@@ -45,6 +45,7 @@ class CleanOptions:
     safe_reorder: bool = False
     merge_lines: bool = False
     clean_comments: bool = False
+    remove_transparent_dialogues: bool = False
     clean_unknown_tags: bool = False
     clean_extradata_refs: bool = False
     clean_project_garbage: bool = False
@@ -85,6 +86,7 @@ class LineChange:
     before: str
     after: str
     stats: TextCleanStats
+    removed_event: bool = False
 
 
 @dataclasses.dataclass
@@ -93,6 +95,7 @@ class CleanResult:
     output_path: Path
     changed_dialogues: int = 0
     processed_dialogues: int = 0
+    transparent_dialogues_removed: int = 0
     comment_lines_removed: int = 0
     marker_references_removed: int = 0
     project_garbage_removed: bool = False
@@ -156,6 +159,14 @@ class BatchCleanResult:
     def removed_comment_lines(self) -> int:
         return sum(
             item.result.comment_lines_removed
+            for item in self.items
+            if item.result is not None
+        )
+
+    @property
+    def removed_transparent_dialogues(self) -> int:
+        return sum(
+            item.result.transparent_dialogues_removed
             for item in self.items
             if item.result is not None
         )
@@ -1524,6 +1535,82 @@ def collect_transform_analysis(
     return (fields if all_fields_known else None), preceding_by_piece
 
 
+def remove_fully_transparent_color_writes(
+    parts: list[TextPart],
+    initial: dict[str, str],
+    styles: dict[str, AssStyle],
+    original_style: str,
+    wrap_style: int,
+    protected_fields: set[str] | None,
+    stats: TextCleanStats,
+) -> None:
+    """Remove color writes whose complete lifetime is statically transparent."""
+    if protected_fields is None:
+        return
+
+    eligible_channels = {
+        channel
+        for channel in range(1, 5)
+        if "color%d" % channel not in protected_fields
+        and "alpha%d" % channel not in protected_fields
+    }
+    if not eligible_channels:
+        return
+
+    state = dict(initial)
+    current_writer: dict[int, TagPiece | None] = {
+        channel: None for channel in eligible_channels
+    }
+    candidates: set[TagPiece] = set()
+    live: set[TagPiece] = set()
+
+    for part in parts:
+        if part.kind == "text":
+            if part.raw:
+                for channel, writer in current_writer.items():
+                    if writer is not None and state.get("alpha%d" % channel) != "FF":
+                        live.add(writer)
+            continue
+        if not part.is_override:
+            # Verified extradata-reference comments are renderer-inert. Other
+            # comments have already stopped semantic cleanup for the event.
+            continue
+        for piece in part.pieces:
+            if piece.kind != "tag" or piece.removed:
+                continue
+            if piece.name == "t":
+                # Candidate channels touched by any transform were excluded
+                # above; disjoint transforms do not affect their visibility.
+                continue
+            action = action_for_piece(
+                piece, state, styles, original_style, wrap_style
+            )
+            if not action.valid:
+                # Do not make a visibility claim across malformed or retained
+                # extension syntax whose renderer interpretation is uncertain.
+                return
+
+            written_colors = {
+                channel
+                for channel in eligible_channels
+                if "color%d" % channel in action.values
+            }
+            explicit_channel: int | None = None
+            if piece.name in ("c", "1c", "2c", "3c", "4c"):
+                explicit_channel = 1 if piece.name == "c" else int(piece.name[0])
+            for channel in written_colors:
+                if channel == explicit_channel:
+                    current_writer[channel] = piece
+                    candidates.add(piece)
+                else:
+                    # A Style reset overwrites the prior explicit color write.
+                    current_writer[channel] = None
+            apply_action(state, action)
+
+    for piece in candidates - live:
+        remove_piece(piece, stats)
+
+
 def raw_empty_reset(piece: TagPiece) -> bool:
     return piece.name in ("c", "1c", "2c", "3c", "4c") and piece.argument == ""
 
@@ -1945,6 +2032,16 @@ def clean_ass_text(
         )
         index = end
 
+    remove_fully_transparent_color_writes(
+        parts,
+        initial,
+        styles,
+        style_name,
+        wrap_style,
+        protected_fields,
+        stats,
+    )
+
     stats.normalized_numbers += normalize_drawing_parts(
         parts, initial, styles, style_name, wrap_style
     )
@@ -2037,6 +2134,151 @@ def render_text_parts(
 
 
 TIME_RELATIVE_TAGS = {"t", "fad", "fade", "k", "K", "kf", "ko", "kt"}
+
+
+def event_text_is_always_fully_transparent(
+    event: AssEvent,
+    styles: dict[str, AssStyle],
+    wrap_style: int,
+    clean_unknown_tags: bool,
+) -> bool:
+    """Prove that every renderable span has all four static alpha channels at FF."""
+    style_name = event.get("Style", "Default")
+    style = styles.get(style_name)
+    start_ms, end_ms = event.start_ms, event.end_ms
+    if not style or start_ms is None or end_ms is None or end_ms <= start_ms:
+        return False
+    text = event.text
+    if collect_renderer_specific_tags(text):
+        return False
+    parts = parse_text_parts(text)
+    stats = TextCleanStats()
+    if clean_unknown_tags:
+        remove_unknown_tags(parts, stats)
+    if collect_unsupported_tags(parts):
+        return False
+    opaque_comment = any(
+        part.kind == "block"
+        and not part.is_override
+        and re.fullmatch(r"(?:=\d+)+", part.raw) is None
+        for part in parts
+    )
+    if opaque_comment:
+        return False
+
+    initial = style_state(style, wrap_style)
+    duration = end_ms - start_ms
+    remove_identity_transforms(
+        parts,
+        initial,
+        styles,
+        style_name,
+        wrap_style,
+        duration,
+        stats,
+    )
+    protected_fields, _ = collect_transform_analysis(
+        parts,
+        initial,
+        styles,
+        style_name,
+        wrap_style,
+        duration,
+    )
+    alpha_fields = {"alpha1", "alpha2", "alpha3", "alpha4"}
+    if protected_fields is None or protected_fields & alpha_fields:
+        return False
+
+    state = dict(initial)
+    saw_renderable_text = False
+    for part in parts:
+        if part.kind == "text":
+            if part.raw:
+                saw_renderable_text = True
+                if any(state.get(field) != "FF" for field in alpha_fields):
+                    return False
+            continue
+        if not part.is_override:
+            continue
+        for piece in part.pieces:
+            if piece.kind != "tag" or piece.removed:
+                continue
+            if piece.name == "t":
+                continue
+            action = action_for_piece(
+                piece, state, styles, style_name, wrap_style
+            )
+            if not action.valid:
+                return False
+            apply_action(state, action)
+    return saw_renderable_text
+
+
+def event_collision_layer(event: AssEvent) -> str:
+    if event.field_index("Layer") is None:
+        return "0"
+    value = integer_truncated(event.get("Layer"))
+    return value if value is not None else "0"
+
+
+def fully_transparent_events_safe_to_remove(
+    document: AssDocument,
+    clean_unknown_tags: bool,
+) -> list[AssEvent]:
+    """Find invisible events whose deletion cannot alter collision placement."""
+    dialogues = [event for event in document.events if event.kind == "Dialogue"]
+    transparent = {
+        id(event)
+        for event in dialogues
+        if event_text_is_always_fully_transparent(
+            event,
+            document.styles,
+            document.wrap_style,
+            clean_unknown_tags,
+        )
+    }
+    if not transparent:
+        return []
+
+    safe: set[int] = {
+        id(event)
+        for event in dialogues
+        if id(event) in transparent and event_has_explicit_position(event)
+    }
+    collision_events = [
+        event
+        for event in dialogues
+        if not event_has_explicit_position(event)
+        and event.start_ms is not None
+        and event.end_ms is not None
+        and event.end_ms > event.start_ms
+    ]
+    remaining = {id(event): event for event in collision_events}
+    while remaining:
+        _, seed = remaining.popitem()
+        component = [seed]
+        frontier = [seed]
+        while frontier:
+            current = frontier.pop()
+            current_start, current_end = current.start_ms, current.end_ms
+            if current_start is None or current_end is None:
+                continue
+            for other_id, other in list(remaining.items()):
+                if event_collision_layer(other) != event_collision_layer(current):
+                    continue
+                other_start, other_end = other.start_ms, other.end_ms
+                if (
+                    other_start is not None
+                    and other_end is not None
+                    and overlaps(current_start, current_end, other_start, other_end)
+                ):
+                    component.append(other)
+                    frontier.append(other)
+                    del remaining[other_id]
+        if all(id(event) in transparent for event in component):
+            safe.update(id(event) for event in component)
+
+    return [event for event in dialogues if id(event) in safe]
 
 
 def event_has_time_relative_content(event: AssEvent) -> bool:
@@ -2281,8 +2523,37 @@ def clean_ass_file(
     if options.clean_comments:
         result.comment_lines_removed = remove_comment_events(document)
 
+    transparent_events = (
+        fully_transparent_events_safe_to_remove(
+            document, options.clean_unknown_tags
+        )
+        if options.remove_transparent_dialogues
+        else []
+    )
+    transparent_ids = {id(event) for event in transparent_events}
+    result.transparent_dialogues_removed = len(transparent_events)
+
     for event in list(document.events):
         before = event.text
+        if id(event) in transparent_ids:
+            result.processed_dialogues += 1
+            result.changed_dialogues += 1
+            _, marker_count = strip_extradata_prefix(before)
+            result.marker_references_removed += marker_count
+            result.changes.append(
+                LineChange(
+                    event_number=event.event_number,
+                    kind=event.kind,
+                    start=event.get("Start"),
+                    end=event.get("End"),
+                    style=event.get("Style"),
+                    before=before,
+                    after="",
+                    stats=TextCleanStats(),
+                    removed_event=True,
+                )
+            )
+            continue
         working = before
         marker_count = 0
         if remove_refs:
@@ -2321,6 +2592,13 @@ def clean_ass_file(
                     stats=line_stats,
                 )
             )
+
+    for line_index in sorted(
+        (event.line_index for event in transparent_events), reverse=True
+    ):
+        del document.lines[line_index]
+    if transparent_events:
+        document.rebuild_events()
 
     if options.merge_lines:
         result.merged_groups, result.merged_lines = merge_consecutive_identical_events(document)
@@ -2369,6 +2647,8 @@ def build_clean_report(result: CleanResult) -> str:
         "| --- | ---: |",
         "| Processed Dialogue rows | %d |" % result.processed_dialogues,
         "| Modified Dialogue rows | %d |" % result.changed_dialogues,
+        "| Removed always-transparent Dialogue rows | %d |"
+        % result.transparent_dialogues_removed,
         "| Removed Comment rows | %d |" % result.comment_lines_removed,
         "| Removed tags | %d |" % result.stats.removed_tags,
         "| Removed tags unknown to both renderers | %d |" % result.stats.removed_unknown_tags,
@@ -2452,6 +2732,13 @@ def build_clean_report(result: CleanResult) -> str:
             output.extend(
                 ["- Normalized items: %d." % change.stats.normalized_numbers, ""]
             )
+        if change.removed_event:
+            output.extend(
+                [
+                    "- Dialogue row removed: fully transparent for its complete rendered lifetime and collision-safe.",
+                    "",
+                ]
+            )
         output.extend(
             [
                 "Before:",
@@ -2460,7 +2747,11 @@ def build_clean_report(result: CleanResult) -> str:
                 "",
                 "After:",
                 "",
-                markdown_code(change.after),
+                (
+                    "**Dialogue row removed.**"
+                    if change.removed_event
+                    else markdown_code(change.after)
+                ),
                 "",
             ]
         )
@@ -4863,6 +5154,7 @@ def resolve_clean_args(
         "safe_reorder": True,
         "merge_lines": True,
         "clean_comments": False,
+        "remove_transparent_dialogues": False,
         "clean_unknown_tags": True,
         "clean_extradata_references": True,
         "clean_project_garbage": True,
@@ -4957,6 +5249,7 @@ def clean_settings_data(args: argparse.Namespace) -> dict[str, Any]:
         "safe_reorder": bool(args.safe_reorder),
         "merge_lines": bool(args.merge_lines),
         "clean_comments": bool(args.clean_comments),
+        "remove_transparent_dialogues": bool(args.remove_transparent_dialogues),
         "clean_unknown_tags": bool(args.clean_unknown_tags),
         "clean_extradata_references": bool(args.clean_extradata_references),
         "clean_project_garbage": bool(args.clean_project_garbage),
@@ -5050,6 +5343,15 @@ def parse_clean_args(argv: Sequence[str]) -> argparse.Namespace:
         action=argparse.BooleanOptionalAction,
         default=None,
         help="Remove Comment event rows from [Events]; disabled by default",
+    )
+    parser.add_argument(
+        "--remove-transparent-dialogues",
+        action=argparse.BooleanOptionalAction,
+        default=None,
+        help=(
+            "Remove always-transparent Dialogue rows only when collision-safe; "
+            "disabled by default"
+        ),
     )
     parser.add_argument(
         "--clean-unknown-tags",
@@ -5176,6 +5478,9 @@ def run_clean_namespace(args: argparse.Namespace) -> tuple[int, CleanResult, Pat
             safe_reorder=args.safe_reorder,
             merge_lines=args.merge_lines,
             clean_comments=getattr(args, "clean_comments", False),
+            remove_transparent_dialogues=getattr(
+                args, "remove_transparent_dialogues", False
+            ),
             clean_unknown_tags=getattr(args, "clean_unknown_tags", True),
             clean_extradata_refs=args.clean_extradata_references,
             clean_project_garbage=args.clean_project_garbage,
@@ -5451,6 +5756,9 @@ def launch_gui() -> int:
         "safe_reorder": tk.BooleanVar(value=config.get("safe_reorder", True)),
         "merge_lines": tk.BooleanVar(value=config.get("merge_lines", True)),
         "clean_comments": tk.BooleanVar(value=config.get("clean_comments", False)),
+        "remove_transparent_dialogues": tk.BooleanVar(
+            value=config.get("remove_transparent_dialogues", False)
+        ),
         "clean_unknown_tags": tk.BooleanVar(
             value=config.get("clean_unknown_tags", True)
         ),
@@ -5677,6 +5985,10 @@ def launch_gui() -> int:
         ("merge_lines", "Merge consecutive identical static Dialogue rows"),
         ("clean_comments", "Remove Comment event rows from [Events]"),
         (
+            "remove_transparent_dialogues",
+            "Remove always-transparent Dialogue rows when collision-safe",
+        ),
+        (
             "clean_unknown_tags",
             "Remove override tags unknown to both libass and xy-VSFilter",
         ),
@@ -5786,6 +6098,9 @@ def launch_gui() -> int:
             safe_reorder=variables["safe_reorder"].get(),
             merge_lines=variables["merge_lines"].get(),
             clean_comments=variables["clean_comments"].get(),
+            remove_transparent_dialogues=variables[
+                "remove_transparent_dialogues"
+            ].get(),
             clean_unknown_tags=variables["clean_unknown_tags"].get(),
             clean_extradata_references=variables["clean_refs"].get(),
             clean_project_garbage=variables["clean_project"].get(),
@@ -5856,12 +6171,14 @@ def launch_gui() -> int:
                 code, batch = run_clean_batch_namespace(namespace)
                 message = (
                     "Complete: %d files succeeded, %d failed; %d rows modified, %d tags removed, "
-                    "%d Comment rows removed, and %d extradata references removed."
+                    "%d always-transparent Dialogue rows removed, %d Comment rows removed, "
+                    "and %d extradata references removed."
                     % (
                         batch.succeeded,
                         batch.failed,
                         batch.changed_dialogues,
                         batch.removed_tags,
+                        batch.removed_transparent_dialogues,
                         batch.removed_comment_lines,
                         batch.removed_extradata_references,
                     )
@@ -5930,6 +6247,10 @@ def main(argv: Sequence[str]) -> int:
         print("FAILED=%d" % batch.failed)
         print("CHANGED_DIALOGUES=%d" % batch.changed_dialogues)
         print("REMOVED_TAGS=%d" % batch.removed_tags)
+        print(
+            "REMOVED_TRANSPARENT_DIALOGUES=%d"
+            % batch.removed_transparent_dialogues
+        )
         print("REMOVED_COMMENT_LINES=%d" % batch.removed_comment_lines)
         print(
             "REMOVED_EXTRADATA_REFERENCES=%d"

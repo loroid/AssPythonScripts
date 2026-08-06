@@ -6,7 +6,7 @@
 
 [查看脚本](ass_clean_redundant_tags.py)
 
-清理 ASS/SSA 中不改变有效状态的 override 标签、显示前已被覆盖的写入和无意义数值格式。工具还可以执行兼容安全重排、合并连续相同的静态 Dialogue、清理 Aegisub 文件级元数据、生成审计报告，并分别使用 libass 与 xy‑VSFilter 验证清理前后的真实渲染结果。
+清理 ASS/SSA 中不改变有效状态的 override 标签、显示前已被覆盖的写入和无意义数值格式。工具还可以按需删除能够证明不影响碰撞布局的始终透明 Dialogue 行、执行兼容安全重排、合并连续相同的静态 Dialogue、清理 Aegisub 文件级元数据、生成审计报告，并分别使用 libass 与 xy‑VSFilter 验证清理前后的真实渲染结果。
 
 脚本的图形界面、命令行帮助、进度信息、错误信息和生成报告使用英语；本文提供简体中文使用说明。
 
@@ -47,7 +47,7 @@ python ass_clean_redundant_tags.py
 1. 直接运行脚本打开图形界面；提供参数时默认执行清理，也可以显式写出 `clean`。
 2. 添加一个或多个 ASS/SSA 文件、目录，并按需启用递归扫描。
 3. 选择另存、输出目录或原位替换。
-4. 按需启用安全重排、连续行合并、Comment 行删除、未知标签或 Aegisub 元数据清理。
+4. 按需启用安全重排、连续行合并、Comment 行删除、始终透明 Dialogue 行删除、未知标签或 Aegisub 元数据清理。
 5. 需要审计时选择 Markdown 或 HTML 报告。
 6. 需要真实验证时启用 libass、xy‑VSFilter 或两者，并设置渲染并发数。
 
@@ -71,6 +71,7 @@ python ass_clean_redundant_tags.py [clean] <输入文件或目录> [其他设置
 | 兼容安全重排 | `--safe-reorder` |
 | 合并连续相同行 | `--merge-lines` |
 | 删除 Comment 事件行 | `--clean-comments`；默认关闭 |
+| 删除始终透明的 Dialogue 行 | `--remove-transparent-dialogues`；默认关闭 |
 | 删除两端未知标签 | `--clean-unknown-tags` |
 | 删除 extradata 引用 | `--clean-extradata-references` |
 | 删除 Project Garbage | `--clean-project-garbage` |
@@ -135,6 +136,7 @@ python ass_clean_redundant_tags.py
 - 兼容安全重排标签
 - 合并连续相同的静态 Dialogue
 - 删除 `[Events]` 中的 Comment 事件行
+- 删除能够证明不影响碰撞布局的始终透明 Dialogue 行
 - 删除 libass 与 xy‑VSFilter 均不识别的 override 标签
 - 删除事件开头的 `{=数字}` extradata 引用
 - 删除 `[Aegisub Project Garbage]`
@@ -216,7 +218,7 @@ python ass_clean_redundant_tags.py clean "input.ass" `
 
 ### 清理选项示例
 
-安全重排、连续行合并、两端未知 override 标签清理、HTML 报告、三类 Aegisub 元数据清理和 libass 对比均默认启用；xy‑VSFilter 对比默认关闭：
+安全重排、连续行合并、两端未知 override 标签清理、HTML 报告、三类 Aegisub 元数据清理和 libass 对比均默认启用；Comment 行删除、始终透明 Dialogue 行删除和 xy‑VSFilter 对比默认关闭：
 
 ```powershell
 python ass_clean_redundant_tags.py clean "input.ass"
@@ -253,6 +255,24 @@ python ass_clean_redundant_tags.py clean "input.ass" --in-place
 ## 标签清理规则
 
 程序按 Style 初始状态和文本推进顺序维护有效状态，不做单纯的字符串去重。
+
+### 清理规则速查表
+
+| 情况 | 涉及标签或语法 | 何时清理 | 何时保留 |
+| --- | --- | --- | --- |
+| 等于当前有效状态 | `\fn`、`\fs`、`\fsp`、`\b`、`\i`、`\u`、`\s`、缩放/旋转/倾斜、描边/阴影/模糊、`\c`/`\1c`–`\4c`、`\alpha`/`\1a`–`\4a`、`\q`、`\p`、`\pbo`、`\fe` | 解析后的值已等于活动 Style 或前序有效状态，且没有相关 transform 依赖 | 标签在已显示文字后恢复状态、确实改变状态，或为 transform 提供起点字段 |
+| 同一显示边界前被后写入完全覆盖 | `\fs`、`\fscx`、`\c`、`\alpha`、`\bord`、`\shad` 等静态状态标签 | 后面的确定性写入在任何文字使用前完整覆盖前标签写入的所有字段 | 两次写入之间已有文字、复合字段只被覆盖一部分，或 transform 可能读取前值 |
+| 颜色通道完全透明 | `\c`/`\1c`、`\2c`、`\3c`、`\4c` | 对应 `\alpha` 或 `\1a`–`\4a` 在该颜色写入的完整生命周期内都能确定为 `&HFF&` | 颜色被覆盖/reset 前透明度恢复，或 transform 可能修改该通道的颜色/透明度 |
+| 整个 Dialogue 行始终透明 | 完整 Dialogue 事件 | 已启用 `remove_transparent_dialogues`，每个实际文字/绘图区间的四通道都能确定为 `&HFF&`，没有 alpha transform 恢复可见，且删除事件不会改变碰撞布局 | 选项未启用、任一区间可能可见、语法不透明，或同层未定位碰撞组中还包含可见事件 |
+| first-wins 行级属性 | `\pos`/`\move`、`\org`、`\fad`/`\fade`、`\an`/`\a` | 同族第一个有效标签已经决定整行，后续同族有效标签无效；首个 alignment 等于 Style 时也可删除 | 首个有效几何/fade 标签保留；畸形写法形成保守边界 |
+| 重复 Style reset | `\r`、`\rStyleName` | 同一 reset 目标在文字显示前重复，且后一个 reset 不改变任何有效字段 | reset 切换到不同 Style、清除中间修改，或位于已经显示的文字之后 |
+| identity 或时间上无效的 transform | `\t(...)` | 已解析 modifier 均不改变字段、modifier 清理后为空，或动画在事件结束时/之后才开始 | modifier 改变状态、需要现有字段作为动画起点、存在嵌套/不透明内容，或无法完整解析 |
+| libass 与 xy‑VSFilter 均未知 | 未知 override 标签，以及 `\t` 内可安全拆分的未知 modifier | 启用 `clean_unknown_tags`，且确认该 token 不在两端兼容集合中 | 任一渲染器支持，或其语法/位置无法安全隔离 |
+| karaoke 时序 | `\k`、`\K`、`\kf`、`\ko`、`\kt` | 不会仅因数值看似无效就删除 | 作为时序/文本解释状态保留；数值仍可规范化，标签仍可做兼容安全重排 |
+| clip 与绘图数据 | `\clip`、`\iclip`、`\p` 绘图路径 | 会规范化无意义小数零和绘图 token 写法，不会仅凭几何猜测删除未使用 clip | 无法从静态字段等值证明 clip 语义或绘图可见性时保留 |
+| 清理后变空或彼此相邻的 override block | `{\redundant}`、`{\tag1}{\tag2}` | 块内 override 标签全部删除后移除该块；相邻块均可解析且中间没有保守边界时合并 | 字面 comment、畸形内容、渲染器特有 HTML 状态或其他不透明内容会保留块或边界 |
+
+表中的“清理”始终以 libass 与 xy‑VSFilter 各自的有效标签状态不变为前提，并不表示所有文本相同的重复标签都会删除。
 
 例如，Style 的 `ScaleX` 为 `100` 时：
 
@@ -331,6 +351,46 @@ Style reset 与 transform 同时出现时，程序先切换活动 Style，再按
 ```
 
 首个 `\blur200` 和 `\fscx60` 分别影响已经显示的 `A`、`B`，不能因后续出现相同值而删除；两个 reset 也必须保留，因为它们分别决定 `C`、`D` 的 Style。只有当前状态下确实不再产生作用的重复写入和 Style 等值标签会被移除。
+
+### 完全透明通道的颜色标签
+
+当 `\c` / `\1c`–`\4c` 对应的 `\alpha` 或 `\1a`–`\4a` 通道在该颜色写入的完整生命周期内都能确定为 `&HFF&` 时，程序会删除这个颜色标签。判断会继续跟踪后续文字、单通道透明度覆盖、替代颜色和 `\r`，而不只检查同一个 override block。例如：
+
+```ass
+{\1a&HFF&\1c&H112233&}A{\1c&H445566&\1a&H00&}B
+```
+
+清理为：
+
+```ass
+{\1a&HFF&}A{\1c&H445566&\1a&H00&}B
+```
+
+第一个颜色在生效期间不可见，并在主通道恢复可见前被新颜色覆盖。如果没有这个替代颜色，原颜色会在 `B` 上重新可见，因此必须保留：
+
+```ass
+{\1a&HFF&\1c&H112233&}A{\1a&H00&}B
+```
+
+四个通道分别独立分析。可能修改对应颜色或透明度的 transform 会保护该通道；能够完整解析且只修改无关字段的 transform 不会阻止清理。行级 fade 无法让静态 `&HFF&` 通道重新可见。遇到畸形语法、不透明 transform 或未知 transform 字段时，这项优化会保守停止。
+
+### 始终透明的 Dialogue 行
+
+此功能默认关闭。在图形界面中勾选 **Remove always-transparent Dialogue rows when collision-safe**、在 JSON 中设置 `"remove_transparent_dialogues": true`，或使用：
+
+```powershell
+python ass_clean_redundant_tags.py clean "input.ass" --remove-transparent-dialogues
+```
+
+启用后，只有当一个 Dialogue 行的每个实际文字或绘图区间都能证明四个通道完全透明时，程序才会删除整个事件。`\alpha&HFF&` 与分别设置 `\1a`–`\4a` 为 `&HFF&` 都能识别；作出决定前还会继续跟踪后续覆盖、`\r` 和 alpha transform。
+
+不可见事件仍可能占据碰撞框。libass 与 xy‑VSFilter 都会让排在同层可见事件之前的未定位透明事件参与碰撞，从而改变可见字幕的位置。因此，始终透明还不够；程序只会在同时证明以下任一布局条件时删除：
+
+- 事件存在有效 `\pos` 或 `\move`，不参与普通碰撞定位。
+- 与它同层、未定位且时间重叠的完整碰撞连通组全部由始终透明事件组成。
+- 没有同层未定位事件与它重叠，这是上一条只有单个事件时的情况。
+
+其他层的可见重叠事件不会阻止删除；同层碰撞连通组中只要存在可见事件，即使候选行本身没有像素也会保留。未知或畸形语法、渲染器特有 HTML 状态，以及任何可能修改 `\alpha` 或 `\1a`–`\4a` 的 transform 也会让整行保留。
 
 普通 brace comment、畸形参数、无法解析的块和渲染器特有 HTML 状态会形成保守边界。
 
@@ -706,6 +766,7 @@ python ass_clean_redundant_tags.py clean --settings settings.json
 | `safe_reorder` | 是否执行兼容安全重排 |
 | `merge_lines` | 是否合并连续相同的静态 Dialogue |
 | `clean_comments` | 是否删除 `[Events]` 中的 Comment 事件行；默认 `false` |
+| `remove_transparent_dialogues` | 是否在不影响碰撞布局时删除始终透明的 Dialogue 行；默认 `false` |
 | `clean_unknown_tags` | 是否删除 libass 与 xy‑VSFilter 均不识别的标签；默认 `true` |
 | `clean_extradata_references` | 是否删除事件开头的 extradata 引用 |
 | `clean_project_garbage` | 是否删除 `[Aegisub Project Garbage]` |
