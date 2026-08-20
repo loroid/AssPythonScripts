@@ -263,10 +263,11 @@ python ass_clean_redundant_tags.py clean "input.ass" --in-place
 | 等于当前有效状态 | `\fn`、`\fs`、`\fsp`、`\b`、`\i`、`\u`、`\s`、缩放/旋转/倾斜、描边/阴影/模糊、`\c`/`\1c`–`\4c`、`\alpha`/`\1a`–`\4a`、`\q`、`\p`、`\pbo`、`\fe` | 解析后的值已等于活动 Style 或前序有效状态，且没有相关 transform 依赖 | 标签在已显示文字后恢复状态、确实改变状态，或为 transform 提供起点字段 |
 | 同一显示边界前被后写入完全覆盖 | `\fs`、`\fscx`、`\c`、`\alpha`、`\bord`、`\shad` 等静态状态标签 | 后面的确定性写入在任何文字使用前完整覆盖前标签写入的所有字段 | 两次写入之间已有文字、复合字段只被覆盖一部分，或 transform 可能读取前值 |
 | 颜色通道完全透明 | `\c`/`\1c`、`\2c`、`\3c`、`\4c` | 对应 `\alpha` 或 `\1a`–`\4a` 在该颜色写入的完整生命周期内都能确定为 `&HFF&` | 颜色被覆盖/reset 前透明度恢复，或 transform 可能修改该通道的颜色/透明度 |
+| 描边或阴影几何不存在 | `\3c`、`\3a`；`\4c`、`\4a` | 对应写入的完整生命周期内，描边两轴或阴影两轴始终为零；BorderStyle 1 和 3 均适用 | 写入生效期间任一轴恢复为非零，或相关 transform、无法确认的语法可能让效果可见 |
 | 整个 Dialogue 行始终透明 | 完整 Dialogue 事件 | 已启用 `remove_transparent_dialogues`，每个实际文字/绘图区间的四通道都能确定为 `&HFF&`，没有 alpha transform 恢复可见，且删除事件不会改变碰撞布局 | 选项未启用、任一区间可能可见、语法不透明，或同层未定位碰撞组中还包含可见事件 |
 | first-wins 行级属性 | `\pos`/`\move`、`\org`、`\fad`/`\fade`、`\an`/`\a` | 同族第一个有效标签已经决定整行，后续同族有效标签无效；首个 alignment 等于 Style 时也可删除 | 首个有效几何/fade 标签保留；畸形写法形成保守边界 |
 | 重复 Style reset | `\r`、`\rStyleName` | 同一 reset 目标在文字显示前重复，且后一个 reset 不改变任何有效字段 | reset 切换到不同 Style、清除中间修改，或位于已经显示的文字之后 |
-| identity 或时间上无效的 transform | `\t(...)` | 已解析 modifier 均不改变字段、modifier 清理后为空，或动画在事件结束时/之后才开始 | modifier 改变状态、需要现有字段作为动画起点、存在嵌套/不透明内容，或无法完整解析 |
+| identity、重复目标或时间上无效的 transform | `\t(...)` | 已解析 modifier 均不改变字段、后一个显式 transform 在同字段相同目标已经稳定后才开始、确定性静态/reset 写入已经提供该目标、modifier 清理后为空，或动画在事件结束时/之后才开始 | 目标不同、区间重叠、时间倒序、中间写入改变该字段，或无法完整解析 |
 | libass 与 xy‑VSFilter 均未知 | 未知 override 标签，以及 `\t` 内可安全拆分的未知 modifier | 启用 `clean_unknown_tags`，且确认该 token 不在两端兼容集合中 | 任一渲染器支持，或其语法/位置无法安全隔离 |
 | karaoke 时序 | `\k`、`\K`、`\kf`、`\ko`、`\kt` | 不会仅因数值看似无效就删除 | 作为时序/文本解释状态保留；数值仍可规范化，标签仍可做兼容安全重排 |
 | clip 与绘图数据 | `\clip`、`\iclip`、`\p` 绘图路径 | 会规范化无意义小数零和绘图 token 写法，不会仅凭几何猜测删除未使用 clip | 无法从静态字段等值证明 clip 语义或绘图可见性时保留 |
@@ -374,6 +375,40 @@ Style reset 与 transform 同时出现时，程序先切换活动 Style，再按
 
 四个通道分别独立分析。可能修改对应颜色或透明度的 transform 会保护该通道；能够完整解析且只修改无关字段的 transform 不会阻止清理。行级 fade 无法让静态 `&HFF&` 通道重新可见。遇到畸形语法、不透明 transform 或未知 transform 字段时，这项优化会保守停止。
 
+### 描边或阴影不存在时的颜色与透明度
+
+libass 与 xy‑VSFilter 在 `\xbord`、`\ybord` 同时为零时都不会使用描边颜色和透明度，在 `\xshad`、`\yshad` 同时为零时也不会使用阴影颜色和透明度；BorderStyle 1 与 BorderStyle 3 均已实测。程序因此只在对应几何效果于一次写入的完整生命周期内始终不存在时，删除显式 `\3c`/`\3a` 或 `\4c`/`\4a`：
+
+```ass
+{\bord0\3c&H112233&\3a&H80&}A
+```
+
+清理为：
+
+```ass
+{\bord0}A
+```
+
+如果颜色或透明度被覆盖/reset 之前任一描边轴恢复为非零，这些写入就会实际影响后续文字，必须保留：
+
+```ass
+{\bord0\3c&H112233&\3a&H80&}A{\xbord2}B
+```
+
+颜色与透明度分别跟踪覆盖关系。全局 `\alpha` 会覆盖此前的 `\3a`/`\4a` 状态，但不会仅因某一个效果宽度为零而被整标签删除，因为它还同时控制其他通道：
+
+```ass
+{\shad0\4a&H80&}A{\alpha&H20&\shad2}B
+```
+
+清理为：
+
+```ass
+{\shad0}A{\alpha&H20&\shad2}B
+```
+
+生命周期证明会同时跟踪 Style reset、复合与单轴几何、后续文字区间和相关 transform。只修改通道颜色/透明度的 transform 无法生成缺失的几何效果，不会阻止删除；可能把描边或阴影任一轴变成非零的 transform 则会保护这些写入。几何值未知或依赖不透明时保留候选标签。
+
 ### 始终透明的 Dialogue 行
 
 此功能默认关闭。在图形界面中勾选 **Remove always-transparent Dialogue rows when collision-safe**、在 JSON 中设置 `"remove_transparent_dialogues": true`，或使用：
@@ -452,6 +487,7 @@ m 100 100 l 200 200
 程序按字段分析简单 `\t`：
 
 - identity transform 可以删除
+- 时间单调且区间不重叠的序列中，后续 transform 重复已经稳定的目标值时可以删除；零时长和非零时长区间都支持
 - 完全落在事件结束时间之后的有效 transform 可以删除
 - transform 修改的字段会保护真正改变动画起点的静态状态；transform 之前与当前有效状态相同的写入仍可删除
 - 与 transform 字段无关的静态冗余标签仍可独立删除
@@ -492,6 +528,20 @@ Text
 ```ass
 {\fscx80\t(0,500,\fscx200)}Text
 ```
+
+逐帧导出的字幕可能反复写入已经稳定的目标值。下面第一次在 250 ms 写入的 `\1a&H00&` 有效，后续相同的瞬时写入均为冗余：
+
+```ass
+{\1a&HFF&\t(42,42,\1a&HCC&)\t(83,83,\1a&H9A&)\t(250,250,\1a&H00&)\t(292,292,\1a&H00&)\t(334,334,\1a&H00&)}Text
+```
+
+清理为：
+
+```ass
+{\1a&HFF&\t(42,42,\1a&HCC&)\t(83,83,\1a&H9A&)\t(250,250,\1a&H00&)}Text
+```
+
+这项时间轴证明处理带显式起止时间、能够完整解析的绝对 modifier。目标值在 transform 结束时稳定；后续不重叠 transform 再次写入相同值时，无论任一区间是零时长还是非零时长都可以删除。确定性的静态写入或 reset 也会建立新的目标值，因此后续写入相同目标的 transform 同样可以删除。目标不同、区间重叠或时间倒序的当前 transform 会因确实改变输出而保留；等所有已保留区间结束后，其最终目标仍可继续证明更晚的重复写入无效，只有不透明 modifier 才会停止相关字段的后续证明。修改无关字段的 transform 不会阻断判断。字体名、粗体、斜体、下划线、删除线、编码和 `\fsc` 等离散或兼容 modifier 已分别通过 libass 与 xy‑VSFilter 差分，也按相同规则处理。
 
 ### 复杂 transform 案例
 
@@ -717,13 +767,13 @@ libass ↔ xy-VSFilter
 
 清理选项、输入输出、报告和真实渲染设置都可以保存到 JSON。项目包含可直接修改使用的 [`settings.example.json`](settings.example.json) 模板。
 
-示范配置中的输入和输出保持为空：
+示范配置中的输入保持为空，并预设相对字幕输出与报告文件夹：
 
 ```json
 {
   "inputs": [],
   "output": null,
-  "output_dir": null,
+  "output_dir": "cleanoutput",
   "in_place": false,
   "safe_reorder": true,
   "merge_lines": true,
@@ -732,6 +782,8 @@ libass ↔ xy-VSFilter
   "clean_extradata_references": true,
   "clean_project_garbage": true,
   "clean_extradata": true,
+  "report": null,
+  "report_dir": "cleanoutput",
   "write_reports": true,
   "report_format": "html",
   "compare_libass": true,
@@ -759,7 +811,7 @@ python ass_clean_redundant_tags.py clean --settings settings.json
 | :--- | :--- |
 | `inputs` | 输入文件或目录数组；省略、设为 `null` 或 `[]` 时从命令行读取 |
 | `output` | 单文件输出路径；不使用时为 `null` |
-| `output_dir` | 批量输出目录；不使用时为 `null` |
+| `output_dir` | 批量输出目录；示例使用相对路径 `cleanoutput` |
 | `in_place` | 是否替换原字幕 |
 | `backup` | 原位替换时是否创建 `.bak` |
 | `recursive` | 是否递归扫描输入目录 |
@@ -772,7 +824,7 @@ python ass_clean_redundant_tags.py clean --settings settings.json
 | `clean_project_garbage` | 是否删除 `[Aegisub Project Garbage]` |
 | `clean_extradata` | 是否删除 `[Aegisub Extradata]` 及关联引用 |
 | `report` | 单文件报告路径；不使用时为 `null` |
-| `report_dir` | 批量报告目录；不使用时为 `null` |
+| `report_dir` | 批量报告目录；示例使用相对路径 `cleanoutput` |
 | `write_reports` | 是否为每个输入生成报告 |
 | `report_format` | 批量报告格式：`md` 或 `html` |
 | `compare_libass` | 是否在清理后使用 libass 对比 |
@@ -790,7 +842,7 @@ python ass_clean_redundant_tags.py clean --settings settings.json
 
 命令行中明确提供的输入会整体替换 JSON 的 `inputs`。`--output`、`--output-dir`、`--report` 和 `--report-dir` 会覆盖 JSON 中对应的路径选择；其他命令行参数分别覆盖同名 JSON 字段。布尔选项可以使用对应的 `--no-*` 写法临时关闭，例如 `--no-safe-reorder`、`--no-merge-lines` 和 `--no-compare-libass`。
 
-JSON 中的相对路径以运行命令时的当前目录为基准。`output`、`output_dir` 与 `in_place: true` 不能同时生效；`report` 与 `report_dir` 也不能同时设置。
+JSON 中工具和报告的相对路径以运行命令时的当前目录为基准，因此示例使用当前目录下的 `cleanoutput` 作为报告根目录；相对 `output_dir` 则遵循前文的输入相对规则。清理后的字幕会写到单独字幕旁或所选文件夹内的 `cleanoutput` 文件夹，并保留扫描得到的子目录结构。`output`、`output_dir` 与 `in_place: true` 不能同时生效；`report` 与 `report_dir` 也不能同时设置。
 
 把命令行和 JSON 合并后的有效设置保存为新文件：
 

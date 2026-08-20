@@ -1,7 +1,7 @@
 {
   "inputs": [],
   "output": null,
-  "output_dir": null,
+  "output_dir": "cleanoutput",
   "in_place": false,
   "backup": true,
   "recursive": false,
@@ -17,7 +17,7 @@
   "clean_extradata": true,
 
   "report": null,
-  "report_dir": null,
+  "report_dir": "cleanoutput",
   "write_reports": true,
   "report_format": "html",
 

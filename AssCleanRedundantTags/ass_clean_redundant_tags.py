@@ -33,7 +33,7 @@ import traceback
 from typing import Any, Callable, Iterable, Iterator, Sequence
 
 
-VERSION = "1.1"
+VERSION = "1.2"
 EXIT_PASS = 0
 EXIT_DIFFERENCE = 1
 EXIT_INCOMPLETE = 2
@@ -189,6 +189,7 @@ class AssStyle:
     scale_y: str = "100"
     spacing: str = "0"
     angle: str = "0"
+    border_style: str = "1"
     outline: str = "0"
     shadow: str = "0"
     alignment: str = "2"
@@ -341,6 +342,7 @@ def parse_ass_document_text(text: str, encoding: str = "utf-8") -> AssDocument:
                         scale_y=mapping.get("scaley", "100"),
                         spacing=mapping.get("spacing", "0"),
                         angle=mapping.get("angle", "0"),
+                        border_style=mapping.get("borderstyle", "1"),
                         outline=mapping.get("outline", "0"),
                         shadow=mapping.get("shadow", "0"),
                         alignment=mapping.get("alignment", "2"),
@@ -1069,7 +1071,8 @@ STYLE_STATE_FIELDS = (
     "fontname", "font_size", "scale_x", "scale_y", "spacing",
     "bold", "italic", "underline", "strikeout",
     "frx", "fry", "frz", "fax", "fay",
-    "xbord", "ybord", "xshad", "yshad", "blur", "be", "encoding",
+    "border_style", "xbord", "ybord", "xshad", "yshad",
+    "blur", "be", "encoding",
     "color1", "color2", "color3", "color4",
     "alpha1", "alpha2", "alpha3", "alpha4",
 )
@@ -1097,6 +1100,7 @@ def style_state(style: AssStyle, wrap_style: int) -> dict[str, str]:
         "frz": canonical_decimal(style.angle) or "?",
         "fax": "0",
         "fay": "0",
+        "border_style": integer_truncated(style.border_style) or "?",
         "xbord": canonical_decimal(style.outline) or "?",
         "ybord": canonical_decimal(style.outline) or "?",
         "xshad": canonical_decimal(style.shadow) or "?",
@@ -1489,6 +1493,147 @@ def remove_identity_transforms(
                 apply_action(state, action)
 
 
+TIMELINE_TRANSFORM_TAGS = frozenset(STATIC_TAG_FIELDS)
+
+
+def explicit_transform_interval_values(
+    piece: TagPiece,
+    state: dict[str, str],
+    styles: dict[str, AssStyle],
+    original_style: str,
+    wrap_style: int,
+) -> tuple[Decimal, Decimal, dict[str, str]] | None:
+    """Return the interval and absolute targets of a simple explicit transform."""
+    parsed = transform_arguments(piece.argument)
+    if parsed is None:
+        return None
+    prefix, modifiers = parsed
+    if len(prefix) not in (2, 3) or "(" in modifiers or ")" in modifiers:
+        return None
+    numeric_prefix: list[Decimal] = []
+    for value in prefix:
+        number = canonical_decimal(value)
+        if number is None:
+            return None
+        numeric_prefix.append(Decimal(number))
+    if numeric_prefix[0] > numeric_prefix[1]:
+        return None
+
+    trial = dict(state)
+    values: dict[str, str] = {}
+    saw = False
+    for nested in split_override_content(modifiers):
+        if (
+            nested.kind != "tag"
+            or not nested.name
+            or nested.name not in TIMELINE_TRANSFORM_TAGS
+        ):
+            return None
+        action = action_for_piece(
+            nested, trial, styles, original_style, wrap_style
+        )
+        if not action.valid or action.barrier or not action.values:
+            return None
+        if any(field in values for field in action.fields):
+            return None
+        values.update(action.values)
+        apply_action(trial, action)
+        saw = True
+    return (numeric_prefix[0], numeric_prefix[1], values) if saw else None
+
+
+def remove_redundant_timeline_transforms(
+    parts: list[TextPart],
+    initial: dict[str, str],
+    styles: dict[str, AssStyle],
+    original_style: str,
+    wrap_style: int,
+    event_duration_ms: int | None,
+    stats: TextCleanStats,
+) -> None:
+    """Remove later non-overlapping transforms that repeat a settled target.
+
+    An overlapping or out-of-order transform is retained, then its final target
+    can seed later non-overlapping comparisons after every known interval ends.
+    Opaque syntax stops the proof per field. A deterministic static write
+    establishes a fresh target for later tags.
+    """
+    state = dict(initial)
+    settled: dict[str, tuple[Decimal, str]] = {}
+    blocked_fields: set[str] = set()
+    static_time = Decimal("-Infinity")
+
+    for part in parts:
+        if part.kind == "text":
+            if part.raw:
+                settled.clear()
+                blocked_fields.clear()
+            continue
+        if not part.is_override:
+            settled.clear()
+            blocked_fields.clear()
+            continue
+
+        for piece in part.pieces:
+            if piece.kind != "tag" or piece.removed:
+                continue
+            if piece.name != "t":
+                action = action_for_piece(
+                    piece, state, styles, original_style, wrap_style
+                )
+                if not action.valid:
+                    settled.clear()
+                    blocked_fields.update(STYLE_STATE_FIELDS)
+                    continue
+                for field in action.fields:
+                    if field in action.values and field in STYLE_STATE_FIELDS:
+                        settled[field] = (static_time, action.values[field])
+                        blocked_fields.discard(field)
+                    else:
+                        settled.pop(field, None)
+                apply_action(state, action)
+                continue
+
+            interval = explicit_transform_interval_values(
+                piece, state, styles, original_style, wrap_style
+            )
+            if interval is None:
+                fields, _ = nested_transform_info(
+                    piece,
+                    state,
+                    styles,
+                    original_style,
+                    wrap_style,
+                    event_duration_ms,
+                )
+                if fields is None:
+                    settled.clear()
+                    blocked_fields.update(STYLE_STATE_FIELDS)
+                else:
+                    for field in fields:
+                        settled.pop(field, None)
+                    blocked_fields.update(fields)
+                continue
+
+            start, end, values = interval
+            fields = set(values)
+            if fields & blocked_fields:
+                continue
+            overlaps_or_runs_backward = any(
+                field in settled and settled[field][0] > start
+                for field in fields
+            )
+            if not overlaps_or_runs_backward and all(
+                field in settled and settled[field][1] == value
+                for field, value in values.items()
+            ):
+                remove_piece(piece, stats)
+                continue
+            for field, value in values.items():
+                prior_end = settled.get(field, (static_time, ""))[0]
+                settled[field] = (max(prior_end, end), value)
+
+
 def collect_transform_analysis(
     parts: list[TextPart],
     initial: dict[str, str],
@@ -1605,6 +1750,123 @@ def remove_fully_transparent_color_writes(
                 else:
                     # A Style reset overwrites the prior explicit color write.
                     current_writer[channel] = None
+            apply_action(state, action)
+
+    for piece in candidates - live:
+        remove_piece(piece, stats)
+
+
+def effect_geometry_visible(
+    state: dict[str, str], geometry_fields: tuple[str, str]
+) -> bool | None:
+    """Return whether an outline/shadow has nonzero geometry, or None if unknown."""
+    if state.get("border_style") not in ("1", "3"):
+        return None
+    values: list[Decimal] = []
+    for field in geometry_fields:
+        value = canonical_decimal(state.get(field, ""))
+        if value is None:
+            return None
+        values.append(Decimal(value))
+    return any(value != 0 for value in values)
+
+
+def remove_invisible_effect_channel_writes(
+    parts: list[TextPart],
+    initial: dict[str, str],
+    styles: dict[str, AssStyle],
+    original_style: str,
+    wrap_style: int,
+    protected_fields: set[str] | None,
+    stats: TextCleanStats,
+) -> None:
+    """Remove explicit outline/back color or alpha writes that are never observed."""
+    if protected_fields is None:
+        return
+
+    specs: dict[tuple[int, str], tuple[str, tuple[str, str], set[str]]] = {
+        (3, "color"): (
+            "3c",
+            ("xbord", "ybord"),
+            {"xbord", "ybord"},
+        ),
+        (3, "alpha"): (
+            "3a",
+            ("xbord", "ybord"),
+            {"xbord", "ybord"},
+        ),
+        (4, "color"): (
+            "4c",
+            ("xshad", "yshad"),
+            {"xshad", "yshad"},
+        ),
+        (4, "alpha"): (
+            "4a",
+            ("xshad", "yshad"),
+            {"xshad", "yshad"},
+        ),
+    }
+    eligible = {
+        key for key, (_, _, dependencies) in specs.items()
+        if dependencies.isdisjoint(protected_fields)
+    }
+    if not eligible:
+        return
+
+    state = dict(initial)
+    current_writer: dict[tuple[int, str], TagPiece | None] = {
+        key: None for key in eligible
+    }
+    candidates: set[TagPiece] = set()
+    live: set[TagPiece] = set()
+
+    for part in parts:
+        if part.kind == "text":
+            if not part.raw:
+                continue
+            for key, writer in current_writer.items():
+                if writer is None:
+                    continue
+                channel, property_name = key
+                _, geometry_fields, _ = specs[key]
+                geometry_visible = effect_geometry_visible(state, geometry_fields)
+                if geometry_visible is None:
+                    live.add(writer)
+                elif geometry_visible:
+                    if property_name == "alpha" or state.get(
+                        "alpha%d" % channel
+                    ) != "FF":
+                        live.add(writer)
+            continue
+        if not part.is_override:
+            continue
+        for piece in part.pieces:
+            if piece.kind != "tag" or piece.removed:
+                continue
+            if piece.name == "t":
+                # Any transform that can create the corresponding geometry
+                # was excluded above. Color/alpha animation cannot expose a
+                # channel while its outline or shadow geometry remains zero.
+                continue
+            action = action_for_piece(
+                piece, state, styles, original_style, wrap_style
+            )
+            if not action.valid:
+                return
+
+            for key in eligible:
+                channel, property_name = key
+                field = "%s%d" % (property_name, channel)
+                if field not in action.values:
+                    continue
+                explicit_name, _, _ = specs[key]
+                if piece.name == explicit_name:
+                    current_writer[key] = piece
+                    candidates.add(piece)
+                else:
+                    # A global alpha or Style reset ends the prior explicit
+                    # channel write before geometry can make it observable.
+                    current_writer[key] = None
             apply_action(state, action)
 
     for piece in candidates - live:
@@ -1995,6 +2257,15 @@ def clean_ass_text(
         event_duration_ms,
         stats,
     )
+    remove_redundant_timeline_transforms(
+        parts,
+        initial,
+        styles,
+        style_name,
+        wrap_style,
+        event_duration_ms,
+        stats,
+    )
     protected_fields, preceding_transform_fields = collect_transform_analysis(
         parts,
         initial,
@@ -2033,6 +2304,15 @@ def clean_ass_text(
         index = end
 
     remove_fully_transparent_color_writes(
+        parts,
+        initial,
+        styles,
+        style_name,
+        wrap_style,
+        protected_fields,
+        stats,
+    )
+    remove_invisible_effect_channel_writes(
         parts,
         initial,
         styles,

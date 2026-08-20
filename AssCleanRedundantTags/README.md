@@ -257,10 +257,11 @@ The program tracks effective state from the initial Style and the order in which
 | Equal to the current effective state | `\fn`, `\fs`, `\fsp`, `\b`, `\i`, `\u`, `\s`, scale/rotation/shear, border/shadow/blur, `\c`/`\1c`–`\4c`, `\alpha`/`\1a`–`\4a`, `\q`, `\p`, `\pbo`, `\fe` | The parsed value already equals the active Style or preceding effective state, with no relevant transform dependency | The tag restores a value after visible text, changes the active state, or supplies a transform start field |
 | Superseded before the same rendering boundary | Static Style-state tags such as `\fs`, `\fscx`, `\c`, `\alpha`, `\bord`, `\shad` | A later deterministic write completely replaces every field written by the earlier tag before any text uses it | Text occurs between the writes, only part of a compound field is replaced, or a transform may read the earlier value |
 | Color channel fully transparent | `\c`/`\1c`, `\2c`, `\3c`, `\4c` | The corresponding `\alpha` or `\1a`–`\4a` value is provably `&HFF&` for the color write's complete lifetime | Opacity returns before replacement/reset, or a transform may modify that channel's color or alpha |
+| Outline or shadow geometry absent | `\3c`, `\3a`; `\4c`, `\4a` | Both outline axes or both shadow axes stay zero for the write's complete lifetime, including BorderStyle 1 and 3 | Either axis becomes nonzero while the write is active, or a relevant transform or uncertain syntax can make the effect observable |
 | Entire Dialogue row always transparent | The complete Dialogue event | `remove_transparent_dialogues` is enabled, all four channels are provably `&HFF&` at every rendered text/drawing span, no alpha transform can restore visibility, and deleting the event cannot alter collision placement | The option is disabled, any span can become visible, syntax is opaque, or an unpositioned same-layer collision group also contains a visible event |
 | First-wins line property | `\pos`/`\move`, `\org`, `\fad`/`\fade`, `\an`/`\a` | A later valid tag belongs to a family whose first valid occurrence already determines the line; a first alignment equal to Style can also disappear | The first effective geometry/fade tag remains; malformed forms create a conservative boundary |
 | Repeated Style reset | `\r`, `\rStyleName` | The same reset target repeats before text and the later reset changes no effective field | The reset selects a different Style, clears intervening changes, or occurs after rendered text |
-| Identity or temporally inactive transform | `\t(...)` | All parsed modifiers leave their fields unchanged, the modifier list becomes empty, or the transform starts at/after the event end | A modifier changes state, defines animation from a required start value, is nested/opaque, or cannot be fully parsed |
+| Identity, repeated-target, or temporally inactive transform | `\t(...)` | All parsed modifiers leave their fields unchanged, a later explicit transform starts after the same target has settled, a deterministic static/reset write already supplies that target, the modifier list becomes empty, or the transform starts at/after the event end | The target differs, intervals overlap, times run backward, an intervening write changes the field, or the syntax cannot be fully parsed |
 | Unknown to both target renderers | Unknown override tags, including safely separable modifiers inside `\t` | `clean_unknown_tags` is enabled and the token is confirmed outside both compatibility sets | Either renderer supports it, or its syntax/location cannot be isolated safely |
 | Karaoke timing | `\k`, `\K`, `\kf`, `\ko`, `\kt` | Not removed merely because the numeric value looks ineffective | Preserved as timing/interpretation state; values may still be normalized and tags may be compatibility-safely reordered |
 | Clip and drawing data | `\clip`, `\iclip`, `\p` drawing paths | Redundant numeric zeroes and drawing token spelling are normalized; an unused clip is not deleted solely from geometry guesses | Clip semantics or drawing visibility cannot be proved from static field equality |
@@ -368,6 +369,40 @@ The first color is invisible while active and is replaced before primary opacity
 
 The four channels are analyzed independently. A transform that may modify the channel's color or alpha protects it; a fully parsed transform affecting only unrelated fields does not. Line fades cannot make a statically `&HFF&` channel visible. Malformed syntax, an opaque transform, or an unknown transform field disables this optimization conservatively.
 
+### Color and alpha writes for absent outline or shadow
+
+libass and xy-VSFilter both leave outline color/alpha unobservable while `\xbord` and `\ybord` are zero, and leave back color/alpha unobservable while `\xshad` and `\yshad` are zero. This has been verified with both BorderStyle 1 and BorderStyle 3. The program therefore removes explicit `\3c`/`\3a` or `\4c`/`\4a` writes only when the corresponding geometry remains absent for that write's complete lifetime:
+
+```ass
+{\bord0\3c&H112233&\3a&H80&}A
+```
+
+becomes:
+
+```ass
+{\bord0}A
+```
+
+If either outline axis becomes nonzero before the color or alpha is overwritten or reset, the writes are observable and remain unchanged:
+
+```ass
+{\bord0\3c&H112233&\3a&H80&}A{\xbord2}B
+```
+
+Replacement is tracked independently for color and alpha. A global `\alpha` write replaces the prior `\3a`/`\4a` state, but is never removed merely because one effect has zero geometry because it also controls the other channels:
+
+```ass
+{\shad0\4a&H80&}A{\alpha&H20&\shad2}B
+```
+
+becomes:
+
+```ass
+{\shad0}A{\alpha&H20&\shad2}B
+```
+
+Style resets, compound and axis-specific geometry, later text spans, and relevant transforms all participate in the lifetime proof. A transform limited to channel color/alpha cannot create missing geometry and does not block removal; a transform that may make an outline or shadow axis nonzero does. Unknown geometry or an opaque dependency retains the candidate tag.
+
 ### Always-transparent Dialogue rows
 
 This feature is disabled by default. Enable **Remove always-transparent Dialogue rows when collision-safe** in the GUI, set `"remove_transparent_dialogues": true` in JSON, or use:
@@ -446,6 +481,7 @@ Fragments containing unknown drawing tokens, indeterminate `\p` arguments, or co
 Simple `\t` expressions are analyzed field by field:
 
 - Identity transforms can be removed
+- In a monotonic non-overlapping sequence, a later transform that repeats an already-settled target can be removed; both zero-duration and non-zero-duration intervals are supported
 - A valid transform entirely after the event end can be removed
 - Fields modified by a transform protect static state that actually changes the animation start; a preceding write equal to the current effective state can still be removed
 - Static redundant tags unrelated to transform fields can still be removed independently
@@ -486,6 +522,20 @@ If the static value is `\fscx80`, it changes the animation start from the Style'
 ```ass
 {\fscx80\t(0,500,\fscx200)}Text
 ```
+
+Frame-sampled exports may keep writing the same settled target. Here the first `\1a&H00&` at 250 ms is effective, while the later identical instantaneous writes are redundant:
+
+```ass
+{\1a&HFF&\t(42,42,\1a&HCC&)\t(83,83,\1a&H9A&)\t(250,250,\1a&H00&)\t(292,292,\1a&H00&)\t(334,334,\1a&H00&)}Text
+```
+
+This becomes:
+
+```ass
+{\1a&HFF&\t(42,42,\1a&HCC&)\t(83,83,\1a&H9A&)\t(250,250,\1a&H00&)}Text
+```
+
+This timeline proof accepts fully parsed absolute modifiers with explicit start/end times. A target becomes settled at the end of its interval; a later non-overlapping transform to the same value is redundant whether either interval has zero or non-zero duration. A deterministic static/reset write also establishes a fresh target, so a later transform to that same value can be removed. A different target, overlapping interval, or backward timestamp is retained because it changes output. Once every retained interval has ended, its final target can still prove a later repetition redundant; only opaque modifiers stop further proof for the affected fields. Transforms on unrelated fields do not block the proof. Discrete and compatibility modifiers such as font name, bold, italic, underline, strikeout, encoding, and `\fsc` follow the same rule after independent libass and xy-VSFilter differential checks.
 
 ### Complex transform examples
 
@@ -711,13 +761,13 @@ Differential statuses are:
 
 Cleanup options, input and output paths, reports, and actual-rendering settings can all be stored in JSON. [`settings.example.json`](settings.example.json) is a ready-to-edit template.
 
-Inputs and outputs are intentionally blank in the example:
+Inputs remain blank in the example; relative subtitle-output and report folders are preconfigured:
 
 ```json
 {
   "inputs": [],
   "output": null,
-  "output_dir": null,
+  "output_dir": "cleanoutput",
   "in_place": false,
   "safe_reorder": true,
   "merge_lines": true,
@@ -726,6 +776,8 @@ Inputs and outputs are intentionally blank in the example:
   "clean_extradata_references": true,
   "clean_project_garbage": true,
   "clean_extradata": true,
+  "report": null,
+  "report_dir": "cleanoutput",
   "write_reports": true,
   "report_format": "html",
   "compare_libass": true,
@@ -753,7 +805,7 @@ python ass_clean_redundant_tags.py clean --settings settings.json
 | :--- | :--- |
 | `inputs` | Array of input files or directories; read from the command line when omitted, `null`, or `[]` |
 | `output` | Single-file output path; `null` when unused |
-| `output_dir` | Batch output directory; `null` when unused |
+| `output_dir` | Batch output directory; the example uses the relative `cleanoutput` folder |
 | `in_place` | Replace source subtitles |
 | `backup` | Create `.bak` files during in-place replacement |
 | `recursive` | Recursively scan input directories |
@@ -766,7 +818,7 @@ python ass_clean_redundant_tags.py clean --settings settings.json
 | `clean_project_garbage` | Remove `[Aegisub Project Garbage]` |
 | `clean_extradata` | Remove `[Aegisub Extradata]` and associated references |
 | `report` | Single-file report path; `null` when unused |
-| `report_dir` | Batch report directory; `null` when unused |
+| `report_dir` | Batch report directory; the example uses the relative `cleanoutput` folder |
 | `write_reports` | Generate one report for every input |
 | `report_format` | Batch report format: `md` or `html` |
 | `compare_libass` | Compare with libass after cleanup |
@@ -784,7 +836,7 @@ python ass_clean_redundant_tags.py clean --settings settings.json
 
 Explicit command-line inputs replace JSON `inputs` as a group. `--output`, `--output-dir`, `--report`, and `--report-dir` override the corresponding path choices in JSON. Other command-line arguments override matching JSON fields individually. Boolean options have `--no-*` forms for temporary overrides, such as `--no-safe-reorder`, `--no-merge-lines`, and `--no-compare-libass`.
 
-Relative paths in JSON are resolved from the current directory in which the command runs. `output`, `output_dir`, and `in_place: true` are mutually exclusive; `report` and `report_dir` are also mutually exclusive.
+Relative tool and report paths in JSON are resolved from the current directory in which the command runs, so the example uses `cleanoutput` there as its report root. A relative `output_dir` follows the input-relative rules described above, so cleaned subtitles go under a `cleanoutput` folder beside each individually selected file or under each selected directory while preserving scanned subdirectories. `output`, `output_dir`, and `in_place: true` are mutually exclusive; `report` and `report_dir` are also mutually exclusive.
 
 Save the effective settings produced by merging command-line arguments and JSON:
 
