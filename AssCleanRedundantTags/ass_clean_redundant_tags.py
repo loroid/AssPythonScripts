@@ -16,7 +16,7 @@ import concurrent.futures
 import copy
 import dataclasses
 import datetime as _datetime
-from decimal import Decimal, InvalidOperation
+from decimal import Decimal, InvalidOperation, ROUND_HALF_UP
 import difflib
 import html as _html
 import json
@@ -33,7 +33,7 @@ import traceback
 from typing import Any, Callable, Iterable, Iterator, Sequence
 
 
-VERSION = "1.2"
+VERSION = "1.3"
 EXIT_PASS = 0
 EXIT_DIFFERENCE = 1
 EXIT_INCOMPLETE = 2
@@ -44,6 +44,7 @@ EXIT_CONFIGURATION = 3
 class CleanOptions:
     safe_reorder: bool = False
     merge_lines: bool = False
+    clean_pos_margins: bool = True
     clean_comments: bool = False
     remove_transparent_dialogues: bool = False
     clean_unknown_tags: bool = False
@@ -61,6 +62,9 @@ class TextCleanStats:
     reordered_tags: int = 0
     normalized_numbers: int = 0
     removed_blocks: int = 0
+    folded_font_chains: int = 0
+    removed_malformed_tags: int = 0
+    minimality: str = "unproven"
     unsupported_tags: list[str] = dataclasses.field(default_factory=list)
     renderer_specific_tags: list[str] = dataclasses.field(default_factory=list)
 
@@ -72,6 +76,8 @@ class TextCleanStats:
         self.reordered_tags += other.reordered_tags
         self.normalized_numbers += other.normalized_numbers
         self.removed_blocks += other.removed_blocks
+        self.folded_font_chains += other.folded_font_chains
+        self.removed_malformed_tags += other.removed_malformed_tags
         self.unsupported_tags.extend(other.unsupported_tags)
         self.renderer_specific_tags.extend(other.renderer_specific_tags)
 
@@ -86,7 +92,15 @@ class LineChange:
     before: str
     after: str
     stats: TextCleanStats
+    field_changes: list["EventFieldChange"] = dataclasses.field(default_factory=list)
     removed_event: bool = False
+
+
+@dataclasses.dataclass(frozen=True)
+class EventFieldChange:
+    name: str
+    before: str
+    after: str
 
 
 @dataclasses.dataclass
@@ -103,6 +117,7 @@ class CleanResult:
     extradata_records_removed: int = 0
     merged_groups: int = 0
     merged_lines: int = 0
+    margin_fields_cleared: int = 0
     changes: list[LineChange] = dataclasses.field(default_factory=list)
     stats: TextCleanStats = dataclasses.field(default_factory=TextCleanStats)
 
@@ -148,6 +163,10 @@ class BatchCleanResult:
         )
 
     @property
+    def folded_font_chains(self) -> int:
+        return sum(item.result.stats.folded_font_chains for item in self.items if item.result is not None)
+
+    @property
     def removed_extradata_references(self) -> int:
         return sum(
             item.result.marker_references_removed
@@ -167,6 +186,14 @@ class BatchCleanResult:
     def removed_transparent_dialogues(self) -> int:
         return sum(
             item.result.transparent_dialogues_removed
+            for item in self.items
+            if item.result is not None
+        )
+
+    @property
+    def margin_fields_cleared(self) -> int:
+        return sum(
+            item.result.margin_fields_cleared
             for item in self.items
             if item.result is not None
         )
@@ -292,7 +319,10 @@ def parse_ass_document_text(text: str, encoding: str = "utf-8") -> AssDocument:
     newline_match = re.search(r"\r\n|\n|\r", text)
     newline = newline_match.group(0) if newline_match else os.linesep
     final_newline = text.endswith(("\r", "\n"))
-    lines = text.splitlines()
+    # Unicode separators inside Text are subtitle data, not ASS line endings.
+    lines = re.split(r"\r\n|\n|\r", text)
+    if final_newline:
+        lines.pop()
     styles: dict[str, AssStyle] = {}
     events: list[AssEvent] = []
     section = ""
@@ -300,30 +330,41 @@ def parse_ass_document_text(text: str, encoding: str = "utf-8") -> AssDocument:
     event_fields: tuple[str, ...] = ()
     event_number = 0
     wrap_style = 0
+    uncertain_styles = False
+    uncertain_event_format = False
 
     for line_index, line in enumerate(lines):
-        section_match = re.match(r"^\s*\[([^\]]+)\]\s*$", line)
+        structure_line = line.lstrip(" \t")
+        relaxed_line = line.lstrip()
+        if (section == "script info" and relaxed_line != structure_line
+                and re.match(r"(?i)^wrapstyle\s*:", relaxed_line)):
+            wrap_style = -1
+        if (relaxed_line.startswith("[") and relaxed_line != structure_line):
+            # A Unicode-indented section can be ignored by only one renderer.
+            uncertain_styles = uncertain_event_format = True
+        section_match = re.match(r"^\s*\[([^\]]+)\]\s*$", line, re.ASCII)
         if section_match:
-            section = section_match.group(1).strip().casefold()
+            section = section_match.group(1).strip(" \t\r\n\v\f").casefold()
             continue
         if section == "script info":
-            info = re.match(r"^\s*([^:;]+?)\s*:\s*(.*?)\s*$", line)
-            if info and info.group(1).strip().casefold() == "wrapstyle":
-                try:
-                    candidate = int(info.group(2))
-                    if 0 <= candidate <= 3:
-                        wrap_style = candidate
-                except ValueError:
-                    pass
+            info = re.match(r"^\s*([^:;]+?)\s*:\s*(.*?)\s*$", line, re.ASCII)
+            if info and info.group(1).strip(" \t\r\n\v\f").casefold() == "wrapstyle":
+                value = info.group(2)
+                # Do not turn Unicode digits/whitespace into a native q2.
+                wrap_style = int(value) if (structure_line.startswith("WrapStyle:")
+                                            and re.fullmatch(r"[0-3]", value)) else -1
         elif section in ("v4+ styles", "v4 styles"):
-            if line.casefold().startswith("format:"):
-                style_fields = tuple(item.strip() for item in line.split(":", 1)[1].split(","))
-            elif line.casefold().startswith("style:") and style_fields:
-                payload = line.split(":", 1)[1].lstrip()
+            if (re.match(r"(?i)^(?:format|style)\s*:", relaxed_line)
+                    and not structure_line.startswith(("Format:", "Style:"))):
+                uncertain_styles = True
+            if structure_line.startswith("Format:"):
+                style_fields = tuple(item.strip(" \t") for item in structure_line.split(":", 1)[1].split(","))
+            elif structure_line.startswith("Style:") and style_fields:
+                payload = structure_line.split(":", 1)[1].lstrip(" \t")
                 values = payload.split(",", len(style_fields) - 1)
                 if len(values) == len(style_fields):
                     mapping = {
-                        key.casefold(): value.strip()
+                        key.casefold(): value.strip(" \t")
                         for key, value in zip(style_fields, values)
                     }
                     style = AssStyle(
@@ -350,10 +391,12 @@ def parse_ass_document_text(text: str, encoding: str = "utf-8") -> AssDocument:
                     )
                     styles[style.name] = style
         elif section == "events":
-            if line.casefold().startswith("format:"):
-                event_fields = tuple(item.strip() for item in line.split(":", 1)[1].split(","))
+            if re.match(r"(?i)^format\s*:", relaxed_line) and not structure_line.startswith("Format:"):
+                uncertain_event_format = True
+            if structure_line.startswith("Format:"):
+                event_fields = tuple(item.strip(" \t") for item in structure_line.split(":", 1)[1].split(","))
                 continue
-            event_match = re.match(r"^(\s*(Dialogue|Comment)\s*:\s*)(.*)$", line, re.I)
+            event_match = re.match(r"^([ \t]*(Dialogue|Comment):[ \t]*)(.*)$", line)
             if not event_match or not event_fields:
                 continue
             values = event_match.group(3).split(",", len(event_fields) - 1)
@@ -370,6 +413,10 @@ def parse_ass_document_text(text: str, encoding: str = "utf-8") -> AssDocument:
                     fields=event_fields,
                 )
             )
+    if uncertain_styles:
+        styles.clear()
+    if uncertain_event_format:
+        events.clear()
     return AssDocument(lines, newline, final_newline, encoding, styles, events, wrap_style)
 
 
@@ -393,7 +440,7 @@ def write_ass_document(document: AssDocument, path: Path) -> None:
 
 
 def parse_ass_time_ms(value: str) -> int | None:
-    match = re.fullmatch(r"\s*(\d+):(\d\d):(\d\d)[.](\d\d)\s*", value)
+    match = re.fullmatch(r"\s*([0-9]+):([0-9]{2}):([0-9]{2})[.]([0-9]{2})\s*", value, re.ASCII)
     if not match:
         return None
     hours, minutes, seconds, centiseconds = (int(item) for item in match.groups())
@@ -476,8 +523,8 @@ def remove_comment_events(document: AssDocument) -> int:
     return removed
 
 
-NUMBER_RE = re.compile(r"^[+-]?(?:\d+(?:\.\d*)?|\.\d+)$")
-NUMBER_PREFIX_RE = re.compile(r"^[+-]?(?:\d+(?:\.\d*)?|\.\d+)")
+NUMBER_RE = re.compile(r"^[+-]?(?:[0-9]+(?:\.[0-9]*)?|\.[0-9]+)$")
+NUMBER_PREFIX_RE = re.compile(r"^[+-]?(?:[0-9]+(?:\.[0-9]*)?|\.[0-9]+)")
 
 
 def canonical_decimal(
@@ -486,7 +533,7 @@ def canonical_decimal(
     preserve_plus: bool = False,
     preserve_negative_zero: bool = False,
 ) -> str | None:
-    text = str(value).strip()
+    text = str(value).strip(" \t\r\n\v\f")
     if not NUMBER_RE.fullmatch(text):
         return None
     try:
@@ -503,7 +550,10 @@ def canonical_decimal(
         else:
             result = "0"
     else:
-        result = format(number.normalize(), "f")
+        # Decimal.normalize() obeys the current precision (usually 28) and can
+        # round a long literal across a native double's midpoint. Formatting
+        # the original coefficient removes spelling zeros without rounding.
+        result = format(number, "f")
         if "." in result:
             result = result.rstrip("0").rstrip(".")
         if result == "-0":
@@ -684,6 +734,9 @@ class TagPiece:
     argument: str = ""
     removed: bool = False
     original_ordinal: int = -1
+    pinned: bool = False
+    policy_fields: frozenset[str] = dataclasses.field(default_factory=frozenset)
+    preserve_malformed_children: bool = False
 
 
 @dataclasses.dataclass
@@ -695,9 +748,9 @@ class TextPart:
 
     @property
     def is_override(self) -> bool:
-        return any(piece.kind == "tag" for piece in self.pieces) and all(
+        return not self.raw.strip() or (any(piece.kind == "tag" for piece in self.pieces) and all(
             piece.kind == "tag" or not piece.raw.strip() for piece in self.pieces
-        )
+        ))
 
     def content(self) -> str:
         return "".join(piece.raw for piece in self.pieces if not piece.removed)
@@ -710,6 +763,11 @@ class TagAction:
     values: dict[str, str] = dataclasses.field(default_factory=dict)
     barrier: bool = False
     line_wide: bool = False
+    reads: tuple[str, ...] = ()
+    unknown_fields: tuple[str, ...] = ()
+    effects: tuple[str, ...] = ()
+    renderer_values: dict[str, dict[str, str]] = dataclasses.field(default_factory=dict)
+    classification: str = "normal"
 
 
 def parse_tag_name(raw: str) -> str | None:
@@ -854,18 +912,15 @@ def normalize_drawing_text(value: str) -> tuple[str, int] | None:
     index = 0
     while index < len(value):
         character = value[index]
-        if character.isspace() or character == ",":
+        if character in " \t\r\n\v\f":
             index += 1
             continue
-        lower = character.casefold()
-        if lower in DRAWING_COMMANDS:
-            tokens.append(lower)
-            if character != lower:
-                changed += 1
+        if character in DRAWING_COMMANDS:
+            tokens.append(character)
             index += 1
             continue
         match = re.match(
-            r"[+-]?(?:\d+(?:\.\d*)?|\.\d+)(?:[eE][+-]?\d+)?",
+            r"[+-]?(?:[0-9]+(?:\.[0-9]*)?|\.[0-9]+)(?:[eE][+-]?[0-9]+)?",
             value[index:],
         )
         if not match:
@@ -973,7 +1028,7 @@ def normalize_tag_piece(piece: TagPiece, depth: int = 0) -> int:
         if argument != argument.strip():
             return 0
         preserve_sign = name == "fs" and argument.startswith(("+", "-"))
-        if name in ("be", "fe"):
+        if name == "fe":
             number = integer_truncated(argument)
         else:
             number = canonical_decimal(
@@ -1028,7 +1083,7 @@ def normalize_parts(parts: list[TextPart]) -> int:
 
 
 def ass_color_components(value: str) -> tuple[str, str] | None:
-    text = value.strip()
+    text = value.strip(" \t\r\n\v\f")
     match = re.fullmatch(r"&H([0-9A-Fa-f]{1,8})&?", text)
     if not match:
         return None
@@ -1046,10 +1101,7 @@ def integer_rounded(value: str) -> str | None:
     if number is None:
         return None
     decimal_value = Decimal(number)
-    if decimal_value >= 0:
-        rounded = int(decimal_value + Decimal("0.5"))
-    else:
-        rounded = int(decimal_value - Decimal("0.5"))
+    rounded = int(decimal_value.to_integral_value(rounding=ROUND_HALF_UP))
     return str(rounded)
 
 
@@ -1057,11 +1109,14 @@ def integer_truncated(value: str) -> str | None:
     number = canonical_decimal(value)
     if number is None:
         return None
-    return str(int(Decimal(number)))
+    decimal_value = Decimal(number)
+    if not -(1 << 31) <= decimal_value < (1 << 31):
+        return None
+    return str(int(decimal_value))
 
 
 def style_flag(value: str) -> str:
-    number = canonical_decimal(value)
+    number = integer_truncated(value)
     if number is None:
         return "?"
     return "0" if Decimal(number) == 0 else "1"
@@ -1079,6 +1134,14 @@ STYLE_STATE_FIELDS = (
 
 
 def style_state(style: AssStyle, wrap_style: int) -> dict[str, str]:
+    def native_number(value: str, nonnegative: bool = False) -> str:
+        text = canonical_decimal(value)
+        if text is None:
+            return "?"
+        number = float(text)
+        if not math.isfinite(number) or (nonnegative and number < 0):
+            return "?"
+        return float_state_value(number)
     colors = [
         ass_color_components(style.primary),
         ass_color_components(style.secondary),
@@ -1087,32 +1150,33 @@ def style_state(style: AssStyle, wrap_style: int) -> dict[str, str]:
     ]
     state: dict[str, str] = {
         "fontname": style.fontname,
-        "font_size": canonical_decimal(style.fontsize) or "?",
-        "scale_x": canonical_decimal(style.scale_x) or "?",
-        "scale_y": canonical_decimal(style.scale_y) or "?",
-        "spacing": canonical_decimal(style.spacing) or "?",
-        "bold": "700" if style_flag(style.bold) == "1" else "0",
+        "font_size": native_number(style.fontsize),
+        "scale_x": native_number(style.scale_x, True),
+        "scale_y": native_number(style.scale_y, True),
+        "spacing": native_number(style.spacing, True),
+        "bold": {"1": "700", "0": "0"}.get(style_flag(style.bold), "?"),
         "italic": style_flag(style.italic),
         "underline": style_flag(style.underline),
         "strikeout": style_flag(style.strikeout),
         "frx": "0",
         "fry": "0",
-        "frz": canonical_decimal(style.angle) or "?",
+        "frz": native_number(style.angle),
         "fax": "0",
         "fay": "0",
         "border_style": integer_truncated(style.border_style) or "?",
-        "xbord": canonical_decimal(style.outline) or "?",
-        "ybord": canonical_decimal(style.outline) or "?",
-        "xshad": canonical_decimal(style.shadow) or "?",
-        "yshad": canonical_decimal(style.shadow) or "?",
+        "xbord": native_number(style.outline, True),
+        "ybord": native_number(style.outline, True),
+        "xshad": native_number(style.shadow, True),
+        "yshad": native_number(style.shadow, True),
         "blur": "0",
         "be": "0",
-        "encoding": integer_rounded(style.encoding) or "?",
-        "alignment": integer_rounded(style.alignment) or "?",
-        "wrap_style": str(wrap_style),
+        "encoding": integer_truncated(style.encoding) or "?",
+        "alignment": integer_truncated(style.alignment) or "?",
+        "wrap_style": str(wrap_style) if wrap_style in (0, 1, 2, 3) else "?",
         "p": "0",
         "pbo": "0",
         "active_style": style.name,
+        "animation_epoch": "static",
     }
     for index, components in enumerate(colors, 1):
         state["color%d" % index] = components[0] if components else "?"
@@ -1125,7 +1189,58 @@ def legacy_alignment(value: int) -> int | None:
     return mapping.get(value)
 
 
-def action_for_piece(
+def float_state_value(value: float) -> str:
+    """A round-trippable native double, without an exponent or integer rounding."""
+    return str(int(value)) if value.is_integer() else format(Decimal(repr(value)), "f")
+
+
+def native_compat_color(argument: str, digits: int) -> str | None:
+    # Native parsers accept bare hexadecimal digits and a lone H prefix too.
+    # Policy classification remains malformed, independently of known values.
+    match = re.fullmatch(r"[&H]*([0-9A-Fa-f]+)[&H]*", argument)
+    if match is None:
+        return None
+    if len(match[1].lstrip("0")) > digits:
+        return None
+    value = int(match[1], 16)
+    return "%0*X" % (digits, value & ((1 << (digits * 4)) - 1))
+
+
+def native_numeric_argument(name: str, argument: str) -> str | None:
+    """A bounded C numeric prefix, without changing the original spelling."""
+    if not argument or any(char in argument for char in "()\\"):
+        return None
+    # Wide-character xy-VSFilter parsing is not interchangeable with C strtod
+    # for Unicode digits. Only the verified ASCII prefix domain is modeled.
+    if any(ord(character) > 127 for character in argument):
+        return None
+    stripped = argument.lstrip(" \t\r\n\v\f")
+    if not stripped or (stripped[0].isspace() and stripped[0] not in " \t\r\n\v\f"):
+        return None
+    if re.match(r"[+-]?(?:inf|nan|0[xX])", stripped, re.I):
+        return None
+    integral = name in ("b", "i", "u", "s", "fe", "an", "a", "q", "p")
+    pattern = r"[+-]?[0-9]+" if integral else r"[+-]?(?:[0-9]+(?:\.[0-9]*)?|\.[0-9]+)(?:[eE][+-]?[0-9]+)?"
+    match = re.match(pattern, stripped)
+    value = match[0] if match else "0"
+    if integral:
+        if len(value.lstrip("+-0")) > 10: return None
+        number = int(value)
+        if not -(1 << 31) <= number < (1 << 31): return None
+        value = str(number)
+    else:
+        number = float(value)
+        if not math.isfinite(number): return None
+        value = float_state_value(number)
+    if name == "fs":
+        if argument.startswith("+") and not value.startswith("+"): value = "+" + value
+        elif argument.startswith("-") and not value.startswith("-"): value = "-" + value
+        elif not argument.startswith(("+", "-")) and value.startswith(("+", "-")):
+            value = " " + value
+    return value
+
+
+def _static_action_for_piece(
     piece: TagPiece,
     state: dict[str, str],
     styles: dict[str, AssStyle],
@@ -1142,11 +1257,12 @@ def action_for_piece(
             return TagAction(False, barrier=True)
         return TagAction(True, LINE_TAG_FIELDS[name], barrier=True, line_wide=True)
     if name in ("an", "a"):
-        number = integer_truncated(argument)
+        fallback = styles.get(state.get("active_style", original_style)) if state.get("_renderer") != "xy" else styles.get(original_style)
+        number = integer_truncated(argument) if argument else (integer_truncated(fallback.alignment) if fallback else None)
         if number is None:
             return TagAction(False, barrier=True)
         value = int(number)
-        if name == "a":
+        if name == "a" and argument:
             mapped = legacy_alignment(value)
             if mapped is None:
                 return TagAction(False, barrier=True)
@@ -1161,18 +1277,18 @@ def action_for_piece(
             line_wide=True,
         )
     if name == "q":
-        number = integer_truncated(argument)
+        number = integer_truncated(argument) if argument else str(wrap_style)
         if number is None:
             return TagAction(False, barrier=True)
         return TagAction(
             True,
             ("wrap_style",),
-            {"wrap_style": number},
+            {"wrap_style": number if 0 <= int(number) <= 3 else str(wrap_style)},
             barrier=True,
             line_wide=True,
         )
     if name == "p":
-        number = integer_truncated(argument)
+        number = integer_truncated(argument) if argument else "0"
         if number is None:
             return TagAction(False, barrier=True)
         return TagAction(
@@ -1182,7 +1298,7 @@ def action_for_piece(
             barrier=True,
         )
     if name == "pbo":
-        number = canonical_decimal(argument)
+        number = (integer_truncated(argument) if state.get("_renderer") == "xy" else canonical_decimal(argument)) if argument else "0"
         if number is None:
             return TagAction(False, barrier=True)
         return TagAction(
@@ -1192,8 +1308,8 @@ def action_for_piece(
             barrier=True,
         )
     if name in KARAOKE_FIELDS:
-        number = canonical_decimal(argument)
-        if number is None or Decimal(number) < 0:
+        number = canonical_decimal(argument) if argument else ("0" if name == "kt" else "100")
+        if number is None or Decimal(number) < 0 or not math.isfinite(float(number)) or Decimal(number) * 10 >= (1 << 31):
             return TagAction(False, barrier=True)
         return TagAction(True, KARAOKE_FIELDS[name], barrier=True)
     if name == "t":
@@ -1202,19 +1318,28 @@ def action_for_piece(
         if argument != argument.strip():
             return TagAction(False, barrier=True)
         target_name = argument or original_style
-        target = styles.get(target_name)
+        target = styles.get(target_name) or styles.get(original_style)
         if not target:
             return TagAction(False, barrier=True)
         target_state = style_state(target, wrap_style)
         fields = ("active_style", "animation_epoch", "karaoke_timeline") + STYLE_STATE_FIELDS
         values = {field: target_state[field] for field in STYLE_STATE_FIELDS}
-        values["active_style"] = target_name
+        values["active_style"] = target.name
+        values["animation_epoch"] = "static"
         return TagAction(True, fields, values, barrier=True)
     fields = STATIC_TAG_FIELDS.get(name)
     if not fields:
         return TagAction(False, barrier=True)
     values: dict[str, str] = {}
-    active_style = styles.get(state.get("active_style", original_style), styles.get(original_style))
+    active_style = (styles.get(original_style) if state.get("_renderer") == "xy"
+                    else styles.get(state.get("active_style", original_style)))
+    fallback = style_state(active_style, wrap_style) if active_style else {}
+    if argument == "" and name not in ("fn", "fontname", "fsc"):
+        zero_fields = {"frx", "fry", "fax", "fay", "blur", "be"}
+        values = {field: "0" if field in zero_fields else fallback.get(field, "?") for field in fields}
+        if "?" in values.values():
+            return TagAction(False, barrier=True)
+        return TagAction(True, fields, values, reads=("active_style",))
     if name in ("fn", "fontname"):
         if argument[:1].isspace() or argument.startswith("("):
             return TagAction(False, barrier=True)
@@ -1223,28 +1348,52 @@ def action_for_piece(
             value = active_style.fontname
         values["fontname"] = value
     elif name == "fs":
-        if argument.startswith(("+", "-")):
-            return TagAction(False, fields, barrier=True)
         number = canonical_decimal(argument)
         if number is None:
             return TagAction(False, barrier=True)
-        values["font_size"] = number
+        value = float(number)
+        if argument.startswith(("+", "-")):
+            current = canonical_decimal(state.get("font_size", "?"))
+            if current is None:
+                return TagAction(False, fields, barrier=True, reads=("font_size",))
+            size = float(current)
+            value = (size + size * value / 10 if state.get("_renderer") == "xy"
+                     else size * (1 + value / 10))
+        if not math.isfinite(value):
+            return TagAction(False, fields, barrier=True)
+        values["font_size"] = (float_state_value(value) if value > 0
+                               else fallback.get("font_size", "?"))
     elif name == "fsc":
         if not active_style:
             return TagAction(False, barrier=True)
         # Undocumented compatibility reset supported by libass and xy-VSFilter.
         # Any suffix is ignored: \fsc50 and bare \fsc both restore the active
         # Style's ScaleX and ScaleY values.
-        values["scale_x"] = canonical_decimal(active_style.scale_x) or "?"
-        values["scale_y"] = canonical_decimal(active_style.scale_y) or "?"
+        values["scale_x"] = fallback.get("scale_x", "?")
+        values["scale_y"] = fallback.get("scale_y", "?")
     elif name in ("fscx", "fscy", "fsp", "fr", "frx", "fry", "frz", "fax", "fay",
                   "bord", "xbord", "ybord", "shad", "xshad", "yshad", "blur"):
         number = canonical_decimal(argument)
         if number is None:
             return TagAction(False, barrier=True)
+        value = float(number)
+        if not math.isfinite(value): return TagAction(False, barrier=True)
+        if name in ("fscx", "fscy", "bord", "xbord", "ybord", "shad", "blur"):
+            value = max(0.0, value)
+        if name == "blur" and state.get("_renderer") != "xy": value = min(value, 100.0)
         for field in fields:
-            values[field] = number
-    elif name in ("be", "fe"):
+            values[field] = float_state_value(value)
+    elif name == "be":
+        number = canonical_decimal(argument)
+        if number is None:
+            return TagAction(False, barrier=True)
+        value = float(number)
+        if not math.isfinite(value): return TagAction(False, barrier=True)
+        rounded = value + 0.5
+        integer = int(rounded) if -(1 << 31) < rounded < (1 << 31) else -(1 << 31)
+        values["be"] = (str(max(0, min(127, integer))) if state.get("_renderer") != "xy"
+                        else float_state_value(value))
+    elif name == "fe":
         number = integer_truncated(argument)
         if number is None:
             return TagAction(False, barrier=True)
@@ -1254,12 +1403,22 @@ def action_for_piece(
         if number is None:
             return TagAction(False, barrier=True)
         numeric = int(number)
-        values["bold"] = "0" if numeric == 0 else ("700" if numeric in (-1, 1) else str(numeric))
+        if numeric not in (0, 1) and numeric < 100:
+            if not active_style:
+                return TagAction(False, barrier=True)
+            values["bold"] = style_state(active_style, wrap_style)["bold"]
+        else:
+            values["bold"] = "0" if numeric == 0 else ("700" if numeric == 1 else str(numeric))
     elif name in ("i", "u", "s"):
         number = integer_truncated(argument)
         if number is None:
             return TagAction(False, barrier=True)
-        values[fields[0]] = "0" if int(number) == 0 else "1"
+        if int(number) not in (0, 1):
+            if not active_style:
+                return TagAction(False, barrier=True)
+            values[fields[0]] = style_state(active_style, wrap_style)[fields[0]]
+        else:
+            values[fields[0]] = number
     elif name in ("c", "1c", "2c", "3c", "4c"):
         channel = 1 if name == "c" else int(name[0])
         if argument == "" and active_style:
@@ -1274,31 +1433,207 @@ def action_for_piece(
                 return TagAction(False, barrier=True)
             value = components[0]
         else:
-            value = tag_color(argument, 6)
+            value = tag_color(argument, 6) or native_compat_color(argument, 6)
             if value is None:
                 return TagAction(False, barrier=True)
         values["color%d" % channel] = value
     elif name == "alpha":
-        value = tag_color(argument, 2)
+        value = tag_color(argument, 2) or native_compat_color(argument, 2)
         if value is None:
             return TagAction(False, barrier=True)
         for field in fields:
             values[field] = value
     elif name in ("1a", "2a", "3a", "4a"):
-        value = tag_color(argument, 2)
+        value = tag_color(argument, 2) or native_compat_color(argument, 2)
         if value is None:
             return TagAction(False, barrier=True)
         values[fields[0]] = value
     return TagAction(True, fields, values)
 
 
+ANALYSIS_FIELDS = tuple(dict.fromkeys(
+    STYLE_STATE_FIELDS + ("active_style", "animation_epoch", "karaoke_timeline")
+    + tuple(field for fields in LINE_TAG_FIELDS.values() for field in fields)
+))
+
+IMMEDIATE_TRANSFORM_STYLE_TAGS = frozenset({"fsc", "fn", "fe", "b", "i", "u", "s"})
+
+
+def possible_piece_fields(piece: TagPiece, depth: int = 0) -> tuple[str, ...]:
+    """An over-approximation shared by every analysis, including invalid tokens."""
+    if depth > 16:
+        return ANALYSIS_FIELDS
+    if piece.name is None and piece.raw.startswith("\\") and piece.raw[1:2].isspace():
+        stripped = split_override_content("\\" + piece.raw[1:].lstrip())
+        if len(stripped) == 1 and stripped[0].name in STATIC_TAG_FIELDS:
+            return possible_piece_fields(stripped[0], depth + 1)
+    if (renderer_tag_prefix(piece.raw) is None and unsupported_tag_label(piece.raw)
+            and unknown_piece_is_inert(piece)):
+        return ()
+    if piece.name == "t":
+        parsed = transform_arguments(piece.argument)
+        if parsed is None:
+            return ANALYSIS_FIELDS
+        fields = {"animation_epoch"}
+        for child in split_override_content(parsed[1]):
+            if child.kind != "tag":
+                if child.raw.strip():
+                    return ANALYSIS_FIELDS
+                continue
+            fields.update(possible_piece_fields(child, depth + 1))
+        return tuple(sorted(fields))
+    if "\\" in piece.argument:
+        return ANALYSIS_FIELDS
+    if piece.name == "r":
+        return STYLE_STATE_FIELDS + ("active_style", "animation_epoch")
+    return (
+        STATIC_TAG_FIELDS.get(piece.name or "")
+        or LINE_TAG_FIELDS.get(piece.name or "")
+        or KARAOKE_FIELDS.get(piece.name or "")
+        or ANALYSIS_FIELDS
+    )
+
+
+def action_for_piece(
+    piece: TagPiece,
+    state: dict[str, str],
+    styles: dict[str, AssStyle],
+    original_style: str,
+    wrap_style: int,
+) -> TagAction:
+    if (renderer_tag_prefix(piece.raw) is None and unsupported_tag_label(piece.raw)
+            and unknown_piece_is_inert(piece)):
+        # A retained, proven inert extension is not an assignment to a field,
+        # even if an internal alias happens to resemble its name.
+        return TagAction(True, barrier=True)
+    semantic_piece = piece
+    if piece.argument == "()" and piece.name in (set(STATIC_TAG_FIELDS) | set(NUMERIC_TAGS)):
+        semantic_piece = dataclasses.replace(piece, argument="")
+    elif piece.name in (set(NUMERIC_TAGS) & set(STATIC_TAG_FIELDS)) and canonical_decimal(piece.argument) is None:
+        parsed_number = native_numeric_argument(piece.name, piece.argument)
+        if parsed_number is not None:
+            semantic_piece = dataclasses.replace(piece, argument=parsed_number)
+    native: dict[str, TagAction] = {}
+    for renderer in ("libass", "xy"):
+        projected = {field: state.get(renderer + "::" + field, value)
+                     for field, value in state.items() if "::" not in field}
+        projected["_renderer"] = renderer
+        item = _static_action_for_piece(semantic_piece, projected, styles, original_style, wrap_style)
+        if (piece.name in ("c", "1c", "2c", "3c", "4c", "alpha", "1a", "2a", "3a", "4a")
+                and piece.argument[:1].isspace()):
+            item = TagAction(False, barrier=True)
+        if piece.name != "t" and "\\" in piece.argument:
+            item = TagAction(False, barrier=True)
+        native[renderer] = item
+    fields = tuple(dict.fromkeys(field for item in native.values() for field in item.fields))
+    keys = set().union(*(item.values for item in native.values()))
+    values = {field: native["libass"].values.get(field, "?")
+              if native["libass"].values.get(field) == native["xy"].values.get(field)
+              else "?" for field in keys}
+    action = TagAction(all(item.valid for item in native.values()), fields, values,
+                       barrier=any(item.barrier for item in native.values()),
+                       line_wide=any(item.line_wide for item in native.values()),
+                       renderer_values={key: item.values for key, item in native.items()})
+    if not action.valid:
+        action.fields = possible_piece_fields(piece)
+        action.unknown_fields = action.fields
+    else:
+        action.unknown_fields = tuple(field for field in keys if any(
+            item.values.get(field) == "?" for item in native.values()))
+    action.classification = classify_tag_piece(piece)
+    if piece.name == "fs" and piece.argument.startswith(("+", "-")):
+        action.reads = ("font_size",)
+    if piece.name == "fsc" or (semantic_piece.argument == "" and piece.name in (set(STATIC_TAG_FIELDS) | {"an", "a"})):
+        action.reads += ("active_style",)
+    fallback_read = piece.name == "fn" and piece.argument == "0"
+    if piece.name in ("b", "i", "u", "s"):
+        number = integer_truncated(semantic_piece.argument)
+        if number is not None:
+            fallback_read = (int(number) not in (0, 1) and (piece.name != "b" or int(number) < 100))
+    if piece.name == "fs":
+        number = canonical_decimal(semantic_piece.argument)
+        fallback_read = number is not None and Decimal(number) <= 0
+    if fallback_read and "active_style" not in action.reads:
+        action.reads += ("active_style",)
+    if piece.name == "t":
+        action.reads = action.fields
+        action.effects = ("animation", "collision_layout")
+        parsed = transform_arguments(piece.argument)
+        if parsed is not None and all(canonical_decimal(value) is not None for value in parsed[0]):
+            children = split_override_content(parsed[1])
+            if all(child.kind == "tag" or not child.raw.strip() for child in children):
+                trial = dict(state)
+                touched: set[str] = set()
+                immediate_reads: set[str] = set()
+                for child in children:
+                    if child.kind != "tag":
+                        continue
+                    immediate = (child.name in IMMEDIATE_TRANSFORM_STYLE_TAGS or
+                                 (child.name in STATIC_TAG_FIELDS and child.argument in ("", "()")))
+                    child_action = action_for_piece(child, trial, styles, original_style, wrap_style) if immediate else None
+                    fields = set(possible_piece_fields(child)) - {"animation_epoch"}
+                    touched.update(fields)
+                    if child_action is not None and child_action.valid:
+                        immediate_reads.update(child_action.reads)
+                        apply_action(trial, child_action)
+                    else:
+                        apply_action(trial, TagAction(False, tuple(fields), unknown_fields=tuple(fields)))
+                # Immediate compatibility resets execute even inside transforms.
+                # Interpolated/opaque children remain dynamic; no endpoint is
+                # substituted for a time-dependent value.
+                action.values = {field: trial.get(field, "?") for field in touched
+                                 if all(native_field_value(trial, renderer, field) != "?" for renderer in ("libass", "xy"))}
+                action.renderer_values = {renderer: {field: native_field_value(trial, renderer, field)
+                                                     for field in action.values} for renderer in ("libass", "xy")}
+                action.unknown_fields = tuple(touched - set(action.values)) + ("animation_epoch",)
+                action.reads = tuple((touched - set(action.values)) | immediate_reads)
+                action.valid = True
+    elif piece.name in ("p", "pbo"):
+        action.effects = ("text_interpretation",)
+    elif piece.name in KARAOKE_FIELDS:
+        action.effects = ("karaoke_timeline",)
+    return action
+
+
+def classify_tag_piece(piece: TagPiece) -> str:
+    """Policy classification is independent of whether the current value is known."""
+    if piece.name not in RENDERER_TAG_PREFIXES:
+        return "unknown"
+    if not piece.argument or piece.argument == "()":
+        return "bare"
+    if piece.name == "fs" and piece.argument.startswith(("+", "-")) and canonical_decimal(piece.argument) is not None:
+        return "relative"
+    if piece.name in NUMERIC_TAGS:
+        return "normal" if canonical_decimal(piece.argument) is not None else "malformed"
+    if piece.name in ("c", "1c", "2c", "3c", "4c", "alpha", "1a", "2a", "3a", "4a"):
+        digits = 6 if piece.name.endswith("c") or piece.name == "c" else 2
+        return "normal" if not piece.argument[:1].isspace() and tag_color(piece.argument, digits) is not None else "malformed"
+    return "normal"
+
+
 def apply_action(state: dict[str, str], action: TagAction) -> None:
+    for field in action.unknown_fields:
+        state[field] = "?"
+        for renderer in ("libass", "xy"):
+            state[renderer + "::" + field] = "?"
     for field, value in action.values.items():
         state[field] = value
+    for renderer, values in action.renderer_values.items():
+        for field, value in values.items():
+            state[renderer + "::" + field] = value
 
 
 def action_is_noop(state: dict[str, str], action: TagAction) -> bool:
-    return bool(action.values) and all(state.get(field) == value for field, value in action.values.items())
+    if action.renderer_values:
+        return action.valid and bool(action.values) and all(
+            value != "?" and state.get(renderer + "::" + field, state.get(field)) == value
+            for renderer, values in action.renderer_values.items() for field, value in values.items()
+            if field != "animation_epoch"
+        )
+    return action.valid and bool(action.values) and all(
+        value != "?" and state.get(field) == value
+        for field, value in action.values.items() if field != "animation_epoch"
+    )
 
 
 def nested_transform_info(
@@ -1323,16 +1658,10 @@ def nested_transform_info(
         numeric_prefix.append(Decimal(number))
     if len(numeric_prefix) not in (0, 1, 2, 3):
         return None, False
-    if len(numeric_prefix) in (2, 3) and event_duration_ms is not None:
-        start = numeric_prefix[0]
-        if start >= event_duration_ms:
-            return set(), True
     if "(" in modifiers or ")" in modifiers:
         return None, False
     fields: set[str] = set()
     trial = dict(state)
-    seen_fields: set[str] = set()
-    identity = True
     saw = False
     for nested in split_override_content(modifiers):
         if nested.kind != "tag" or not nested.name or nested.name in LINE_TAG_FIELDS or nested.name in KARAOKE_FIELDS:
@@ -1340,15 +1669,12 @@ def nested_transform_info(
         action = action_for_piece(nested, trial, styles, original_style, wrap_style)
         if not action.valid or action.barrier or not action.values:
             return None, False
-        if any(field in seen_fields for field in action.fields):
-            identity = False
-        seen_fields.update(action.fields)
         fields.update(action.fields)
-        if not action_is_noop(trial, action):
-            identity = False
         apply_action(trial, action)
         saw = True
-    return fields if saw else set(), identity
+    # A same-value interpolation can still differ after native floating-point
+    # arithmetic and quantization. Field discovery is not a deletion proof.
+    return fields if saw else set(), False
 
 
 def iter_tag_pieces(parts: Iterable[TextPart]) -> Iterator[TagPiece]:
@@ -1359,12 +1685,13 @@ def iter_tag_pieces(parts: Iterable[TextPart]) -> Iterator[TagPiece]:
                     yield piece
 
 
-def remove_piece(piece: TagPiece, stats: TextCleanStats) -> None:
-    if piece.removed:
-        return
+def remove_piece(piece: TagPiece, stats: TextCleanStats) -> bool:
+    if piece.removed or piece.pinned:
+        return False
     piece.removed = True
     stats.removed_tags += 1
     stats.removed_tag_labels.append("\\" + (piece.name or "?"))
+    return True
 
 
 def remove_unknown_piece(piece: TagPiece, stats: TextCleanStats) -> None:
@@ -1374,6 +1701,20 @@ def remove_unknown_piece(piece: TagPiece, stats: TextCleanStats) -> None:
     remove_piece(piece, stats)
     stats.removed_unknown_tags += 1
     stats.removed_unknown_tag_labels.append(label or ("\\" + (piece.name or "?")))
+
+
+def unknown_piece_is_inert(piece: TagPiece) -> bool:
+    if "\\" in piece.argument:
+        return False
+    depth = 0
+    for character in piece.argument:
+        if character == "(":
+            depth += 1
+        elif character == ")":
+            depth -= 1
+            if depth < 0:
+                return False
+    return depth == 0
 
 
 def clean_unknown_transform_modifiers(
@@ -1395,7 +1736,7 @@ def clean_unknown_transform_modifiers(
         if item.kind != "tag":
             continue
         renderer_prefix = renderer_tag_prefix(item.raw)
-        if renderer_prefix is None and unsupported_tag_label(item.raw):
+        if renderer_prefix is None and unsupported_tag_label(item.raw) and unknown_piece_is_inert(item):
             remove_unknown_piece(item, stats)
             changed = True
         elif renderer_prefix == "t":
@@ -1403,9 +1744,6 @@ def clean_unknown_transform_modifiers(
     if not changed:
         return False
     modifiers_after = "".join(item.raw for item in nested if not item.removed)
-    if not any(item.kind == "tag" and not item.removed for item in nested):
-        remove_piece(piece, stats)
-        return True
     body = prefix + [modifiers_after]
     piece.raw = "\\t(" + ",".join(body) + ")"
     piece.argument = piece.raw[2:]
@@ -1420,7 +1758,7 @@ def remove_unknown_tags(parts: Iterable[TextPart], stats: TextCleanStats) -> Non
             if piece.kind != "tag" or piece.removed:
                 continue
             renderer_prefix = renderer_tag_prefix(piece.raw)
-            if renderer_prefix is None and unsupported_tag_label(piece.raw):
+            if renderer_prefix is None and unsupported_tag_label(piece.raw) and unknown_piece_is_inert(piece):
                 remove_unknown_piece(piece, stats)
             elif renderer_prefix == "t":
                 clean_unknown_transform_modifiers(piece, stats)
@@ -1435,6 +1773,13 @@ def mark_first_wins(
     stats: TextCleanStats,
 ) -> None:
     first_seen: dict[str, bool] = {}
+    uncertain_fields = {
+        field
+        for piece in iter_tag_pieces(parts)
+        if not piece.removed
+        for field in action_for_piece(piece, initial, styles, original_style, wrap_style).unknown_fields
+    }
+    state = dict(initial)
     for piece in iter_tag_pieces(parts):
         if piece.removed or not piece.name:
             continue
@@ -1447,10 +1792,12 @@ def mark_first_wins(
             "an": "alignment",
             "a": "alignment",
         }.get(piece.name)
+        action = action_for_piece(piece, state, styles, original_style, wrap_style)
         if not family:
+            apply_action(state, action)
             continue
-        action = action_for_piece(piece, initial, styles, original_style, wrap_style)
-        if not action.valid:
+        if not action.valid or set(action.fields) & uncertain_fields:
+            apply_action(state, action)
             continue
         if first_seen.get(family):
             remove_piece(piece, stats)
@@ -1458,6 +1805,49 @@ def mark_first_wins(
         first_seen[family] = True
         if family == "alignment" and action_is_noop(initial, action):
             remove_piece(piece, stats)
+        else:
+            apply_action(state, action)
+
+
+def zero_power_modifier_is_noop(
+    piece: TagPiece, state: dict[str, str], styles: dict[str, AssStyle],
+    original_style: str, wrap_style: int,
+) -> bool:
+    if piece.name not in TIMELINE_TRANSFORM_TAGS or piece.argument in ("", "()"):
+        return False
+    action = action_for_piece(piece, state, styles, original_style, wrap_style)
+    if not action.valid or action.unknown_fields:
+        return False
+    for renderer in ("libass", "xy"):
+        for field in action.fields:
+            value = native_field_value(state, renderer, field)
+            try:
+                number = int(value, 16) if field.startswith(("color", "alpha")) else float(value)
+            except ValueError:
+                return False
+            if not math.isfinite(number) or (field == "font_size" and number <= 0):
+                return False
+    if all(field.startswith(("color", "alpha")) for field in action.fields):
+        return True
+    number = canonical_decimal(piece.argument) or native_numeric_argument(piece.name or "", piece.argument)
+    if number is None or (piece.name == "fs" and piece.argument.startswith(("+", "-"))):
+        return False
+    target = float(number)
+    for field in action.fields:
+        source = float(native_field_value(state, "xy", field))
+        # CalcAnimation bypasses timing when dst and src differ by < 0.0001.
+        result = target if abs(target - source) < 0.0001 else source
+        if piece.name in ("fscx", "fscy", "bord", "xbord", "ybord", "shad", "blur"):
+            result = max(0.0, result)
+        if piece.name == "fs" and result <= 0:
+            original = styles.get(original_style)
+            if original is None: return False
+            fallback = canonical_decimal(original.fontsize)
+            if fallback is None: return False
+            result = float(fallback)
+        if result != source:
+            return False
+    return True
 
 
 def remove_identity_transforms(
@@ -1485,15 +1875,67 @@ def remove_identity_transforms(
                     wrap_style,
                     event_duration_ms,
                 )
-                if identity:
-                    remove_piece(piece, stats)
+                interval = explicit_transform_interval_values(
+                    piece, state, styles, original_style, wrap_style, event_duration_ms
+                )
+                inactive = bool(
+                    interval is not None
+                    and event_duration_ms is not None
+                    and interval[0] >= event_duration_ms
+                    and interval[1] >= interval[0]
+                )
+                if inactive:
+                    trial = dict(state)
+                    def dormant(child: TagPiece) -> bool:
+                        noop = zero_power_modifier_is_noop(child, trial, styles, original_style, wrap_style)
+                        if not noop:
+                            fields = possible_piece_fields(child)
+                            apply_action(trial, TagAction(False, fields, unknown_fields=fields))
+                        return noop
+                    if prune_transform_modifiers(piece, dormant, stats):
+                        _, identity = nested_transform_info(piece, state, styles, original_style, wrap_style, event_duration_ms)
+                if not (identity and may_remove_transform(parts, piece)
+                        and remove_piece(piece, stats)):
+                    apply_action(state, action_for_piece(
+                        piece, state, styles, original_style, wrap_style
+                    ))
                 continue
             action = action_for_piece(piece, state, styles, original_style, wrap_style)
-            if action.valid:
-                apply_action(state, action)
+            apply_action(state, action)
 
 
-TIMELINE_TRANSFORM_TAGS = frozenset(STATIC_TAG_FIELDS)
+TIMELINE_TRANSFORM_TAGS = frozenset({
+    "fs", "fscx", "fscy", "fsp", "fr", "frx", "fry", "frz", "fax", "fay",
+    "bord", "xbord", "ybord", "shad", "xshad", "yshad", "blur",
+    "c", "1c", "2c", "3c", "4c", "alpha", "1a", "2a", "3a", "4a",
+})
+
+
+def transform_has_proven_animation_flags(piece: TagPiece) -> bool:
+    parsed = transform_arguments(piece.argument)
+    if parsed is None or len(parsed[0]) > 3:
+        return False
+    if any(canonical_decimal(value) is None for value in parsed[0]):
+        return False
+    if not parsed[1].strip():
+        return True
+    return all(
+        child.kind == "tag" and renderer_tag_prefix(child.raw) is not None
+        and child.name != "t" and "(" not in child.argument and ")" not in child.argument
+        for child in split_override_content(parsed[1])
+    )
+
+
+def may_remove_transform(parts: Sequence[TextPart], candidate: TagPiece) -> bool:
+    if any(
+        piece is not candidate and piece.name == "t" and not piece.removed
+        and transform_has_proven_animation_flags(piece)
+        for piece in iter_tag_pieces(parts)
+    ):
+        return True
+    # Keep the last original transform's event-wide animation/collision flags.
+    # Only unambiguous explicit positioning makes those layout flags irrelevant.
+    return effective_position_family(parts) in ("pos", "move")
 
 
 def explicit_transform_interval_values(
@@ -1502,6 +1944,7 @@ def explicit_transform_interval_values(
     styles: dict[str, AssStyle],
     original_style: str,
     wrap_style: int,
+    event_duration_ms: int | None = None,
 ) -> tuple[Decimal, Decimal, dict[str, str]] | None:
     """Return the interval and absolute targets of a simple explicit transform."""
     parsed = transform_arguments(piece.argument)
@@ -1515,8 +1958,21 @@ def explicit_transform_interval_values(
         number = canonical_decimal(value)
         if number is None:
             return None
+        if not math.isfinite(float(number)):
+            return None
         numeric_prefix.append(Decimal(number))
-    if numeric_prefix[0] > numeric_prefix[1]:
+    # Native parsers truncate the time arguments; end=0 means event Duration.
+    start = Decimal(int(numeric_prefix[0]))
+    end = Decimal(int(numeric_prefix[1]))
+    if any(abs(value) >= (1 << 31) for value in (start, end)):
+        return None
+    if end == 0:
+        if event_duration_ms is None or not 0 <= event_duration_ms < (1 << 31):
+            return None
+        end = Decimal(event_duration_ms)
+    if len(numeric_prefix) == 3 and numeric_prefix[2] <= 0:
+        return None
+    if start > end:
         return None
 
     trial = dict(state)
@@ -1527,19 +1983,38 @@ def explicit_transform_interval_values(
             nested.kind != "tag"
             or not nested.name
             or nested.name not in TIMELINE_TRANSFORM_TAGS
+            or (nested.name == "fs" and nested.argument.startswith(("+", "-")))
         ):
             return None
         action = action_for_piece(
             nested, trial, styles, original_style, wrap_style
         )
-        if not action.valid or action.barrier or not action.values:
+        if not action.valid or action.barrier or not action.values or any(value == "?" for value in action.values.values()):
             return None
         if any(field in values for field in action.fields):
             return None
         values.update(action.values)
         apply_action(trial, action)
         saw = True
-    return (numeric_prefix[0], numeric_prefix[1], values) if saw else None
+    return (start, end, values) if saw else None
+
+
+def transform_target_signatures(piece: TagPiece) -> dict[str, str | None]:
+    result: dict[str, str | None] = {}
+    parsed = transform_arguments(piece.argument)
+    if parsed is None: return result
+    for child in split_override_content(parsed[1]):
+        if child.kind != "tag": continue
+        fields = possible_piece_fields(child)
+        if child.argument in ("", "()"):
+            signature = None
+        elif all(field.startswith(("color", "alpha")) for field in fields):
+            signature = "integer-channel"
+        else:
+            number = canonical_decimal(child.argument) or native_numeric_argument(child.name or "", child.argument)
+            signature = float_state_value(float(number)) if number is not None else None
+        for field in fields: result[field] = signature
+    return result
 
 
 def remove_redundant_timeline_transforms(
@@ -1560,6 +2035,7 @@ def remove_redundant_timeline_transforms(
     """
     state = dict(initial)
     settled: dict[str, tuple[Decimal, str]] = {}
+    settled_source: dict[str, tuple[str, str | None]] = {}
     blocked_fields: set[str] = set()
     static_time = Decimal("-Infinity")
 
@@ -1567,10 +2043,12 @@ def remove_redundant_timeline_transforms(
         if part.kind == "text":
             if part.raw:
                 settled.clear()
+                settled_source.clear()
                 blocked_fields.clear()
             continue
         if not part.is_override:
             settled.clear()
+            settled_source.clear()
             blocked_fields.clear()
             continue
 
@@ -1582,20 +2060,25 @@ def remove_redundant_timeline_transforms(
                     piece, state, styles, original_style, wrap_style
                 )
                 if not action.valid:
-                    settled.clear()
-                    blocked_fields.update(STYLE_STATE_FIELDS)
+                    for field in action.unknown_fields:
+                        settled.pop(field, None)
+                        settled_source.pop(field, None)
+                    blocked_fields.update(action.unknown_fields)
+                    apply_action(state, action)
                     continue
                 for field in action.fields:
                     if field in action.values and field in STYLE_STATE_FIELDS:
                         settled[field] = (static_time, action.values[field])
+                        settled_source[field] = ("static", None)
                         blocked_fields.discard(field)
                     else:
                         settled.pop(field, None)
+                        settled_source.pop(field, None)
                 apply_action(state, action)
                 continue
 
             interval = explicit_transform_interval_values(
-                piece, state, styles, original_style, wrap_style
+                piece, state, styles, original_style, wrap_style, event_duration_ms
             )
             if interval is None:
                 fields, _ = nested_transform_info(
@@ -1608,30 +2091,52 @@ def remove_redundant_timeline_transforms(
                 )
                 if fields is None:
                     settled.clear()
+                    settled_source.clear()
                     blocked_fields.update(STYLE_STATE_FIELDS)
                 else:
                     for field in fields:
                         settled.pop(field, None)
+                        settled_source.pop(field, None)
                     blocked_fields.update(fields)
+                apply_action(state, action_for_piece(
+                    piece, state, styles, original_style, wrap_style
+                ))
                 continue
 
             start, end, values = interval
+            signatures = transform_target_signatures(piece)
             fields = set(values)
             if fields & blocked_fields:
+                apply_action(state, action_for_piece(
+                    piece, state, styles, original_style, wrap_style
+                ))
                 continue
             overlaps_or_runs_backward = any(
                 field in settled and settled[field][0] > start
                 for field in fields
             )
+            # Floating CalcAnimation can execute a near-equal destination
+            # before its requested start. Only a static source or an earlier
+            # identical instantaneous operation proves that extra write inert.
+            timing_safe = all(
+                signatures.get(field) is not None and (
+                    field.startswith(("color", "alpha"))
+                    or settled_source.get(field, ("", None))[0] == "static"
+                    or settled_source.get(field) == ("instant", signatures[field])
+                ) for field in fields)
             if not overlaps_or_runs_backward and all(
                 field in settled and settled[field][1] == value
                 for field, value in values.items()
-            ):
+            ) and timing_safe and start == end and end > 0 and may_remove_transform(parts, piece) and not piece.pinned:
                 remove_piece(piece, stats)
                 continue
             for field, value in values.items():
                 prior_end = settled.get(field, (static_time, ""))[0]
                 settled[field] = (max(prior_end, end), value)
+                settled_source[field] = ("instant" if start == end and end > 0 else "dynamic", signatures.get(field))
+            apply_action(state, action_for_piece(
+                piece, state, styles, original_style, wrap_style
+            ))
 
 
 def collect_transform_analysis(
@@ -1670,13 +2175,17 @@ def collect_transform_analysis(
                     fields.update(nested)
                     if preceding_fields_known:
                         preceding_fields.update(nested)
+                apply_action(state, action_for_piece(
+                    piece, state, styles, original_style, wrap_style
+                ))
                 continue
             preceding_by_piece[piece] = (
                 set(preceding_fields) if preceding_fields_known else None
             )
             action = action_for_piece(piece, state, styles, original_style, wrap_style)
-            if action.valid:
-                apply_action(state, action)
+            if not action.valid:
+                fields.update(action.unknown_fields)
+            apply_action(state, action)
     return (fields if all_fields_known else None), preceding_by_piece
 
 
@@ -1833,7 +2342,8 @@ def remove_invisible_effect_channel_writes(
                 if geometry_visible is None:
                     live.add(writer)
                 elif geometry_visible:
-                    if property_name == "alpha" or state.get(
+                    animated_dependencies = {"color%d" % channel, "alpha%d" % channel}
+                    if animated_dependencies & protected_fields or property_name == "alpha" or state.get(
                         "alpha%d" % channel
                     ) != "FF":
                         live.add(writer)
@@ -1889,7 +2399,8 @@ def process_override_group(
     stats: TextCleanStats,
 ) -> dict[str, str]:
     pieces = [piece for block in blocks for piece in block.pieces]
-    for _ in range(5):
+    while True:
+        removed_before = stats.removed_tags
         changed = False
         state = dict(start_state)
         seen_empty_resets: set[str] = set()
@@ -1898,9 +2409,17 @@ def process_override_group(
             if piece.kind != "tag" or piece.removed:
                 continue
             if piece.name == "t":
+                apply_action(state, action_for_piece(
+                    piece, state, styles, original_style, wrap_style
+                ))
+                seen_empty_resets.clear()
+                seen_style_resets.clear()
                 continue
             action = action_for_piece(piece, state, styles, original_style, wrap_style)
             if not action.valid:
+                apply_action(state, action)
+                seen_empty_resets.clear()
+                seen_style_resets.clear()
                 continue
             protected = protected_fields is None or bool(set(action.fields) & protected_fields)
             preceding = preceding_transform_fields.get(piece)
@@ -1945,9 +2464,8 @@ def process_override_group(
                 continue
             action = action_for_piece(piece, start_state, styles, original_style, wrap_style)
             if not action.valid:
-                if piece.name is None:
-                    overwritten.clear()
-                    explicitly_overwritten.clear()
+                overwritten.difference_update(action.unknown_fields)
+                explicitly_overwritten.difference_update(action.unknown_fields)
                 continue
             pure = piece.name in STATIC_TAG_FIELDS and bool(action.values)
             protected = protected_fields is None or bool(set(action.fields) & protected_fields)
@@ -1967,6 +2485,8 @@ def process_override_group(
                 overwritten.update(action.fields)
                 if not raw_empty_reset(piece):
                     explicitly_overwritten.update(action.fields)
+                overwritten.difference_update(action.reads)
+                explicitly_overwritten.difference_update(action.reads)
 
         if not has_following_text:
             for piece in pieces:
@@ -1977,16 +2497,15 @@ def process_override_group(
                 if action.valid and not protected and not raw_empty_reset(piece):
                     remove_piece(piece, stats)
                     changed = True
-        if not changed:
+        if stats.removed_tags == removed_before:
             break
 
     state = dict(start_state)
     for piece in pieces:
-        if piece.kind != "tag" or piece.removed or piece.name == "t":
+        if piece.kind != "tag" or piece.removed:
             continue
         action = action_for_piece(piece, state, styles, original_style, wrap_style)
-        if action.valid:
-            apply_action(state, action)
+        apply_action(state, action)
     return state
 
 
@@ -2006,6 +2525,9 @@ def block_can_merge(
         if piece.name == "t":
             if transform_arguments(piece.argument) is None:
                 return False
+            apply_action(trial, action_for_piece(
+                piece, trial, styles, original_style, wrap_style
+            ))
             continue
         action = action_for_piece(piece, trial, styles, original_style, wrap_style)
         if not action.valid:
@@ -2044,7 +2566,7 @@ def reorder_descriptor(
     event_duration_ms: int | None,
     clip_count: int,
 ) -> tuple[int, tuple[str, ...]] | None:
-    if piece.removed or not piece.name or piece.name not in SAFE_REORDER_RANK:
+    if piece.removed or piece.pinned or not piece.name or piece.name not in SAFE_REORDER_RANK:
         return None
     name = piece.name
     if name == "t":
@@ -2061,7 +2583,7 @@ def reorder_descriptor(
         # Both target renderers keep the already parsed karaoke timeline when
         # a reset and a karaoke tag exchange positions inside one override
         # block. The reset still conflicts with transforms and Style fields.
-        fields = ("animation_epoch",) + STYLE_STATE_FIELDS
+        fields = ("active_style", "animation_epoch") + STYLE_STATE_FIELDS
     elif name in KARAOKE_FIELDS:
         # Within one override block, both target renderers apply the final
         # static color/alpha/outline state to the syllable regardless of
@@ -2069,7 +2591,7 @@ def reorder_descriptor(
         # karaoke tag. Keep only the true sequencing dependencies here.
         fields = ("karaoke_timeline",)
     else:
-        fields = action.fields
+        fields = tuple(dict.fromkeys(action.fields + action.reads))
     if not fields:
         return None
     return SAFE_REORDER_RANK[name], tuple(fields)
@@ -2174,8 +2696,7 @@ def safely_reorder_block(
                     index -= 1
                 continue
             action = action_for_piece(left, prefix_state, styles, original_style, wrap_style)
-            if action.valid:
-                apply_action(prefix_state, action)
+            apply_action(prefix_state, action)
             index += 1
     moved = sum(before[piece] != index for index, piece in enumerate(pieces))
     if moved:
@@ -2197,12 +2718,11 @@ def normalize_drawing_parts(
             if not part.is_override:
                 continue
             for piece in part.pieces:
-                if piece.kind != "tag" or piece.removed or piece.name == "t":
+                if piece.kind != "tag" or piece.removed:
                     continue
                 action = action_for_piece(piece, state, styles, original_style, wrap_style)
-                if action.valid:
-                    apply_action(state, action)
-        elif part.raw and int(Decimal(state.get("p", "0"))) > 0:
+                apply_action(state, action)
+        elif part.raw and state.get("p", "0") != "?" and int(Decimal(state.get("p", "0"))) > 0:
             result = normalize_drawing_text(part.raw)
             if result:
                 normalized, count = result
@@ -2212,7 +2732,559 @@ def normalize_drawing_parts(
     return changed
 
 
-def clean_ass_text(
+def coalesce_parseable_override_parts(
+    parts: list[TextPart], initial: dict[str, str], styles: dict[str, AssStyle],
+    style_name: str, wrap_style: int,
+) -> None:
+    """Order the same groups that serialization will merge, in the first pass."""
+    output: list[TextPart] = []
+    state = dict(initial)
+    index = 0
+    while index < len(parts):
+        group = [parts[index]]
+        end = index + 1
+        if group[0].kind == "block" and group[0].is_override:
+            while end < len(parts) and parts[end].kind == "block" and parts[end].is_override:
+                group.append(parts[end])
+                end += 1
+            trial = dict(state)
+            can_merge = True
+            for block in group:
+                can_merge = block_can_merge(block, trial, styles, style_name, wrap_style) and can_merge
+                for piece in block.pieces:
+                    if piece.kind == "tag" and not piece.removed:
+                        apply_action(trial, action_for_piece(piece, trial, styles, style_name, wrap_style))
+            state = trial
+            if can_merge and len(group) > 1:
+                group = [TextPart("block", "".join(block.raw for block in group),
+                                  [piece for block in group for piece in block.pieces])]
+        output.extend(group)
+        index = end
+    parts[:] = output
+
+
+# Every native tag must have an explicit empty-argument category. This is also
+# used as a coverage contract by the independent development audit.
+BARE_TAG_SEMANTICS = {
+    **dict.fromkeys(("fs", "fscx", "fscy", "fsc", "fsp", "bord", "xbord", "ybord",
+                     "shad", "xshad", "yshad", "fr", "frz", "fn", "fe", "b", "i", "u", "s",
+                     "c", "1c", "2c", "3c", "4c", "alpha", "1a", "2a", "3a", "4a"), "renderer-style"),
+    **dict.fromkeys(("frx", "fry", "fax", "fay", "blur", "be", "p", "pbo"), "zero"),
+    **dict.fromkeys(("an", "a"), "alignment-first-wins"),
+    "q": "script-wrap", "r": "original-style-reset",
+    **dict.fromkeys(("k", "K", "kf", "ko"), "karaoke-100cs"), "kt": "karaoke-zero",
+    **dict.fromkeys(("pos", "move", "org", "fad", "fade", "clip", "iclip"), "complex-layout"),
+    "t": "animation-layout",
+}
+
+
+def bounded_style_writer(piece: TagPiece) -> bool:
+    fields = set(possible_piece_fields(piece))
+    return bool(fields) and fields <= set(STYLE_STATE_FIELDS) and "\\" not in piece.argument
+
+
+def pin_policy_boundaries(
+    parts: list[TextPart], initial: dict[str, str], styles: dict[str, AssStyle],
+    style_name: str, wrap_style: int,
+) -> None:
+    """Disabled malformed cleanup pins its connected field region, not the line."""
+    state = dict(initial)
+    index = 0
+    while index < len(parts):
+        group = [parts[index]]
+        end = index + 1
+        if group[0].kind == "block" and group[0].is_override:
+            while end < len(parts) and parts[end].kind == "block" and parts[end].is_override:
+                group.append(parts[end]); end += 1
+            pieces = [piece for block in group for piece in block.pieces
+                      if piece.kind == "tag" and not piece.removed]
+            protected = set()
+            for piece in pieces:
+                if classify_tag_piece(piece) in ("unknown", "malformed"):
+                    piece.pinned = True
+                    protected.update(possible_piece_fields(piece))
+                if piece.name == "t":
+                    parsed = transform_arguments(piece.argument)
+                    children = split_override_content(parsed[1]) if parsed is not None else []
+                    for child in children:
+                        if child.kind == "tag" and classify_tag_piece(child) in ("unknown", "malformed"):
+                            piece.pinned = True
+                            protected.update(possible_piece_fields(child))
+            for piece in pieces:
+                if piece.name == "t":
+                    piece.policy_fields = frozenset(protected)
+                    piece.preserve_malformed_children = True
+                if set(possible_piece_fields(piece)) & protected:
+                    piece.pinned = True
+                apply_action(state, action_for_piece(piece, state, styles, style_name, wrap_style))
+        index = end
+
+
+def native_field_value(state: dict[str, str], renderer: str, field: str) -> str:
+    return state.get(renderer + "::" + field, state.get(field, "?"))
+
+
+def embedded_flags_are_noops(
+    piece: TagPiece, state: dict[str, str], styles: dict[str, AssStyle],
+    style_name: str, wrap_style: int,
+) -> bool:
+    """An unknown container may expose inner flags to either native parser.
+
+    Deletion is safe only when *both* execution and Style fallback of every
+    possible inner flag are no-ops. No general nested-tag stripping is done.
+    """
+    if renderer_tag_prefix(piece.raw) is not None or "\\" not in piece.argument:
+        return False
+    offsets = [match.start() for match in re.finditer(r"\\", piece.argument)]
+    for index, start in enumerate(offsets):
+        raw = piece.argument[start:offsets[index + 1] if index + 1 < len(offsets) else len(piece.argument)]
+        children = split_override_content(raw)
+        if len(children) != 1 or children[0].name not in ("b", "i", "u", "s"):
+            return False
+        child = children[0]
+        argument = child.argument.rstrip(")")
+        if argument not in ("0", "1"):
+            return False
+        for spelling in (argument, ""):
+            action = action_for_piece(dataclasses.replace(child, argument=spelling), state,
+                                      styles, style_name, wrap_style)
+            if not action_is_noop(state, action):
+                return False
+    return bool(offsets)
+
+
+def bounded_transform_power(prefix: list[str]) -> bool:
+    if len(prefix) > 3 or any(canonical_decimal(value) is None for value in prefix):
+        return False
+    values = [float(value) for value in prefix]
+    if any(not math.isfinite(value) for value in values):
+        return False
+    if len(values) >= 2 and any(abs(value) > 1e9 for value in values[:2]):
+        return False
+    return (values[0] > 0 if len(values) == 1 else values[2] > 0 if len(values) == 3 else True)
+
+
+def invariant_native_interpolation(piece: TagPiece, action: TagAction) -> bool:
+    """Prove native evaluation, not just mathematical equality of targets.
+
+    Weighted identical powers of two stay bit-exact under binary64; scale
+    values use libass's actual /100 units. xy-VSFilter bypasses interpolation
+    for an identical target. Non-power-of-two values are not assumed exact.
+    """
+    if piece.name == "fs":
+        argument = piece.argument
+        number = canonical_decimal(argument) or native_numeric_argument("fs", argument)
+        if argument.startswith(("+", "-")):
+            return number is not None and Decimal(number) == 0 and all(
+                float(values.get("font_size", "nan")) > 0 for values in action.renderer_values.values())
+        if number is None or Decimal(number) <= 0:
+            return False
+    if piece.name == "be":
+        number = canonical_decimal(piece.argument) or native_numeric_argument("be", piece.argument)
+        if number is None: return False
+        target = float(number)
+        old = action.renderer_values.get("libass", {}).get("be", "?")
+        if old == "?" or abs(target) > 1e6: return False
+        old_value = float(old)
+        error = 16 * math.ulp(max(1.0, abs(target), abs(old_value)))
+        def rounded(value: float) -> int: return max(0, min(127, int(value + 0.5)))
+        return rounded(min(old_value, target) - error) == old_value == rounded(max(old_value, target) + error)
+    if piece.name not in TIMELINE_TRANSFORM_TAGS:
+        return False
+    def exact_binary(value: float) -> bool:
+        if value == 0: return True
+        if not math.isfinite(value): return False
+        fraction, exponent = math.frexp(abs(value))
+        return fraction == 0.5 and -400 <= exponent <= 400
+    for field, value in action.renderer_values.get("libass", {}).items():
+        if value == "?": return False
+        if field.startswith("color"):
+            if not all(exact_binary(int(value[offset:offset+2], 16)) for offset in (0, 2, 4)): return False
+        elif field.startswith("alpha"):
+            if not exact_binary(int(value, 16)): return False
+        elif field in ("scale_x", "scale_y"):
+            if not exact_binary(float(value) / 100): return False
+        elif not exact_binary(float(value)): return False
+    return bool(action.values)
+
+
+def optimize_static_group(
+    pieces: list[TagPiece], initial: dict[str, str], styles: dict[str, AssStyle],
+    style_name: str, wrap_style: int, clean_unknown_tags: bool, stats: TextCleanStats,
+) -> dict[str, str]:
+    """Finite fixed point: each successful operation removes at least one tag."""
+    piece_order = {piece: index for index, piece in enumerate(pieces)}
+    while True:
+        before_count = sum(not piece.removed for piece in pieces)
+        before_removed = stats.removed_tags
+        state = dict(initial)
+        snapshots: dict[TagPiece, dict[str, str]] = {}
+        actions: dict[TagPiece, TagAction] = {}
+        chains: list[list[TagPiece]] = []
+        chain: list[TagPiece] = []
+        for piece in pieces:
+            if piece.removed or piece.kind != "tag":
+                continue
+            if clean_unknown_tags and embedded_flags_are_noops(piece, state, styles, style_name, wrap_style):
+                remove_piece(piece, stats)
+                continue
+            snapshots[piece] = dict(state)
+            action = action_for_piece(piece, state, styles, style_name, wrap_style)
+            if piece.name == "t":
+                parsed = transform_arguments(piece.argument)
+                if parsed is not None:
+                    trial = dict(state)
+                    removable: set[int] = set()
+                    for child_index, child in enumerate(split_override_content(parsed[1])):
+                        if child.kind != "tag":
+                            continue
+                        child_action = action_for_piece(child, trial, styles, style_name, wrap_style)
+                        exact_noop = (bounded_transform_power(parsed[0]) and child_action.valid
+                                      and action_is_noop(trial, child_action)
+                                      and invariant_native_interpolation(child, child_action))
+                        immediate = (child.name in IMMEDIATE_TRANSFORM_STYLE_TAGS or
+                                     (child.name in STATIC_TAG_FIELDS and child.argument in ("", "()")))
+                        endpoint_only = (len(parsed[0]) >= 2 and all(canonical_decimal(value) is not None for value in parsed[0])
+                                         and int(Decimal(parsed[0][1])) > 0
+                                         and 0 <= int(Decimal(parsed[0][1])) - int(Decimal(parsed[0][0])) <= 1
+                                         and (len(parsed[0]) < 3 or Decimal(parsed[0][2]) > 0))
+                        same_endpoint = (endpoint_only and child.name in TIMELINE_TRANSFORM_TAGS
+                                         and action_is_noop(trial, child_action))
+                        if (immediate and action_is_noop(trial, child_action)) or exact_noop or same_endpoint:
+                            removable.add(child_index)
+                        if immediate or exact_noop or same_endpoint:
+                            apply_action(trial, child_action)
+                        else:
+                            fields = possible_piece_fields(child)
+                            apply_action(trial, TagAction(False, fields, unknown_fields=fields))
+                    if removable:
+                        removable_occurrences = iter(
+                            index in removable
+                            for index, child in enumerate(split_override_content(parsed[1]))
+                            if child.kind == "tag"
+                        )
+                        prune_transform_modifiers(piece, lambda child: next(removable_occurrences), stats)
+                        action = action_for_piece(piece, state, styles, style_name, wrap_style)
+            actions[piece] = action
+            if piece.name == "fs" and not piece.pinned and action.valid:
+                chain.append(piece)
+            elif (piece.name in ("r", "t") or "font_size" in action.fields
+                  or "font_size" in action.reads or "font_size" in action.unknown_fields):
+                if chain: chains.append(chain)
+                chain = []
+            apply_action(state, action)
+        if chain: chains.append(chain)
+
+        # Fold only an existing multi-tag chain with an exact common integer.
+        folded = False
+        for full_chain in chains:
+            if len(full_chain) < 2:
+                continue
+            start = snapshots[full_chain[0]]
+            final = actions[full_chain[-1]].renderer_values
+            if all(native_field_value(start, renderer, "font_size") != "?"
+                   and native_field_value(start, renderer, "font_size") == final.get(renderer, {}).get("font_size")
+                   for renderer in ("libass", "xy")):
+                for piece in full_chain: remove_piece(piece, stats)
+                folded = True
+                continue
+            # Writes before the last absolute assignment are dead, rather
+            # than candidates for needless intermediate synthesized sizes.
+            absolute = [index for index, piece in enumerate(full_chain) if "font_size" not in actions[piece].reads]
+            suffix = full_chain[absolute[-1] if absolute else 0:]
+            for end in range(len(suffix), 1, -1):
+                chain = suffix[:end]
+                last = chain[-1]
+                if "font_size" not in actions[last].reads:
+                    continue
+                values = [actions[last].renderer_values.get(renderer, {}).get("font_size", "?")
+                          for renderer in ("libass", "xy")]
+                if values[0] != values[1] or canonical_decimal(values[0]) is None:
+                    continue
+                number = Decimal(values[0])
+                if number <= 0 or number != number.to_integral_value():
+                    continue
+                last.raw = "\\fs" + str(int(number))
+                last.argument = str(int(number))
+                for piece in chain[:-1]: remove_piece(piece, stats)
+                stats.folded_font_chains += 1
+                folded = True
+                break
+        if folded:
+            continue
+
+        # Forward no-ops require equality in both renderer states.
+        state = dict(initial)
+        for piece in pieces:
+            if piece.kind != "tag" or piece.removed:
+                continue
+            action = action_for_piece(piece, state, styles, style_name, wrap_style)
+            if (not piece.pinned and (piece.name in STATIC_TAG_FIELDS or piece.name == "r")
+                    and action_is_noop(state, action)):
+                remove_piece(piece, stats)
+            else:
+                apply_action(state, action)
+
+        # Unknown writes can be deleted when their entire bounded effect is
+        # killed before a read/observation. They are never assumed to be inert.
+        killed: set[str] = set()
+        for piece in reversed(pieces):
+            if piece.kind != "tag" or piece.removed:
+                continue
+            action = actions[piece]
+            fields = set(action.fields)
+            if piece.name == "t":
+                prune_transform_modifiers(piece, lambda child: (
+                    bounded_style_writer(child) and set(possible_piece_fields(child)) <= killed
+                    and (clean_unknown_tags or classify_tag_piece(child) not in ("unknown", "malformed"))
+                ), stats)
+                action = action_for_piece(piece, snapshots[piece], styles, style_name, wrap_style)
+                fields = set(action.fields)
+            permitted = clean_unknown_tags or classify_tag_piece(piece) not in ("unknown", "malformed")
+            if (not piece.pinned and permitted and bounded_style_writer(piece)
+                    and fields and fields <= killed):
+                remove_piece(piece, stats)
+                continue
+            if piece.name == "r" and not piece.pinned and action.valid and fields <= killed:
+                remove_piece(piece, stats)
+                continue
+            if action.valid:
+                killed.update(action.values)
+                killed.difference_update(action.reads)
+            else:
+                killed.difference_update(action.unknown_fields)
+                # Recognized scalar setters always assign either their parsed
+                # value or native fallback. Their exact value may be unknown,
+                # but they still kill an earlier write. Relative fs reads the
+                # previous size and is deliberately excluded from this rule.
+                if (bounded_style_writer(piece) and piece.name in STATIC_TAG_FIELDS
+                        and piece.name not in ("fn", "fontname")
+                        and not (piece.name == "fs" and piece.argument.startswith(("+", "-")))):
+                    killed.update(fields)
+            # Pinning forbids deleting this token; it does not erase its
+            # definite overwrite of unrelated fields (notably a pinned r).
+
+        # Compositional no-ops: include connected groups, not just single tags.
+        state = dict(initial)
+        runs: list[list[tuple[TagPiece, TagAction, dict[str, str], dict[str, str]]]] = []
+        run = []
+        for piece in pieces:
+            if piece.kind != "tag" or piece.removed:
+                continue
+            start = dict(state)
+            action = action_for_piece(piece, state, styles, style_name, wrap_style)
+            apply_action(state, action)
+            if piece.name in STATIC_TAG_FIELDS and action.valid and not piece.pinned:
+                run.append((piece, action, start, dict(state)))
+            else:
+                if run: runs.append(run)
+                run = []
+        if run: runs.append(run)
+        for run in runs:
+            components: list[tuple[set[str], list[Any]]] = []
+            for item in run:
+                fields = set(item[1].fields) | (set(item[1].reads) - {"active_style"})
+                touching = [component for component in components if component[0] & fields]
+                items = [item]
+                for component in touching:
+                    fields.update(component[0]); items.extend(component[1]); components.remove(component)
+                items.sort(key=lambda entry: piece_order[entry[0]])
+                components.append((fields, items))
+            for fields, items in components:
+                start, finish = items[0][2], items[-1][3]
+                if all(native_field_value(start, renderer, field) != "?"
+                       and native_field_value(start, renderer, field) == native_field_value(finish, renderer, field)
+                       for renderer in ("libass", "xy") for field in fields):
+                    for piece, _, _, _ in items: remove_piece(piece, stats)
+        if sum(not piece.removed for piece in pieces) == before_count and stats.removed_tags == before_removed:
+            break
+    state = dict(initial)
+    for piece in pieces:
+        if piece.kind == "tag" and not piece.removed:
+            apply_action(state, action_for_piece(piece, state, styles, style_name, wrap_style))
+    return state
+
+
+def prune_transform_modifiers(
+    piece: TagPiece, predicate: Callable[[TagPiece], bool], stats: TextCleanStats,
+) -> bool:
+    parsed = transform_arguments(piece.argument)
+    if parsed is None or any(canonical_decimal(value) is None for value in parsed[0]):
+        return False
+    children = split_override_content(parsed[1])
+    if any(child.kind != "tag" and child.raw.strip() for child in children):
+        return False
+    changed = False
+    for child in children:
+        if child.kind == "tag" and piece.preserve_malformed_children:
+            child.pinned = (classify_tag_piece(child) in ("unknown", "malformed")
+                            or bool(set(possible_piece_fields(child)) & piece.policy_fields))
+        if child.kind == "tag" and predicate(child) and "\\" not in child.argument:
+            changed = remove_piece(child, stats) or changed
+    if changed:
+        modifiers = "".join(child.raw for child in children if not child.removed)
+        piece.raw = "\\t(" + ",".join(parsed[0] + [modifiers]) + ")"
+        piece.argument = piece.raw[2:]
+    return changed
+
+
+def remove_time_dominated_modifiers(
+    parts: list[TextPart], initial: dict[str, str], styles: dict[str, AssStyle],
+    style_name: str, wrap_style: int, duration: int | None, stats: TextCleanStats,
+) -> None:
+    """A later transform can finish before an earlier-spelled one even starts.
+
+    Before that finish the earlier transform must be a native power-zero
+    no-op (including xy-VSFilter's near-equal destination shortcut);
+    afterwards the later one overwrites it. This is a time-domain dead-write
+    proof, not an equality-of-targets interpolation shortcut.
+    """
+    state = dict(initial)
+    group: list[tuple[TagPiece, tuple[Decimal, Decimal, dict[str, str]] | None, dict[str, str]]] = []
+    def flush() -> None:
+        for index, (piece, interval, before) in enumerate(group):
+            if interval is None:
+                continue
+            killed: set[str] = set()
+            for later, other, _ in group[index + 1:]:
+                if other is not None and other[1] <= interval[0]:
+                    killed.update(other[2])
+            if killed:
+                prune_transform_modifiers(piece, lambda child: (
+                    child.name in TIMELINE_TRANSFORM_TAGS
+                    and not (child.name == "fs" and child.argument.startswith(("+", "-")))
+                    and bool(possible_piece_fields(child))
+                    and set(possible_piece_fields(child)) <= killed
+                    and classify_tag_piece(child) not in ("unknown", "malformed")
+                    and zero_power_modifier_is_noop(child, before, styles, style_name, wrap_style)
+                ), stats)
+        group.clear()
+    for part in parts:
+        if part.kind != "block" or not part.is_override:
+            flush()
+            continue
+        for piece in part.pieces:
+            if piece.kind != "tag" or piece.removed:
+                continue
+            if piece.name == "t":
+                group.append((piece, explicit_transform_interval_values(
+                    piece, state, styles, style_name, wrap_style, duration), dict(state)))
+            else:
+                # Static/reset/opaque writes can read or replace a time-varying
+                # field. The ordinary liveness pass handles those boundaries.
+                flush()
+            apply_action(state, action_for_piece(piece, state, styles, style_name, wrap_style))
+    flush()
+
+
+def remove_unobservable_channel_modifiers(
+    parts: list[TextPart], initial: dict[str, str], styles: dict[str, AssStyle],
+    style_name: str, wrap_style: int, clean_unknown_tags: bool, stats: TextCleanStats,
+) -> None:
+    """Prove complete lifetime invisibility before touching a transform's colors."""
+    absent_geometry = {3, 4}
+    transparent = {1, 2, 3, 4}
+    state = dict(initial)
+    saw_text = False
+    for part in parts:
+        if part.kind == "text" and part.raw:
+            saw_text = True
+            for renderer in ("libass", "xy"):
+                for channel in tuple(transparent):
+                    if native_field_value(state, renderer, "alpha%d" % channel) != "FF":
+                        transparent.discard(channel)
+                for channel in tuple(absent_geometry):
+                    geometry = ("xbord", "ybord") if channel == 3 else ("xshad", "yshad")
+                    if any(canonical_decimal(native_field_value(state, renderer, field)) != "0" for field in geometry):
+                        absent_geometry.discard(channel)
+        elif part.kind == "block" and part.is_override:
+            for piece in part.pieces:
+                if piece.kind == "tag" and not piece.removed:
+                    apply_action(state, action_for_piece(piece, state, styles, style_name, wrap_style))
+    if not saw_text:
+        return
+    all_hidden = transparent == {1, 2, 3, 4}
+    secondary_read = any(
+        piece.name in KARAOKE_FIELDS or (piece.name != "r" and "karaoke_timeline" in possible_piece_fields(piece))
+        for piece in iter_tag_pieces(parts) if not piece.removed)
+    layout_independent = (effective_position_family(parts) in ("pos", "move") or any(
+        piece.name == "t" and not piece.removed and transform_has_proven_animation_flags(piece)
+        for piece in iter_tag_pieces(parts)))
+    def unused(piece: TagPiece) -> bool:
+        if not clean_unknown_tags and classify_tag_piece(piece) in ("unknown", "malformed"):
+            return False
+        if piece.name in ("c", "1c", "2c", "3c", "4c"):
+            channel = 1 if piece.name == "c" else int(piece.name[0])
+            return channel in absent_geometry or channel in transparent or (channel == 2 and not secondary_read)
+        if piece.name in ("1a", "2a", "3a", "4a"):
+            return int(piece.name[0]) in absent_geometry or (piece.name == "2a" and not secondary_read)
+        if all_hidden and layout_independent and piece.name in ("an", "a", "q", "p", "pbo"):
+            return classify_tag_piece(piece) not in ("unknown", "malformed")
+        # Blur has no text-metric effect. Geometry/font changes on a hidden
+        # event require independent placement (explicit positioning or a
+        # preserved native animation flag), since they can affect collisions.
+        if all_hidden and piece.name in STATIC_TAG_FIELDS and piece.name not in ("alpha", "1a", "2a", "3a", "4a"):
+            return (piece.name in ("blur", "be") or layout_independent) and "\\" not in piece.argument
+        return False
+    for piece in iter_tag_pieces(parts):
+        if piece.removed or (piece.pinned and piece.name != "t"):
+            continue
+        if piece.name == "t":
+            prune_transform_modifiers(piece, unused, stats)
+        elif unused(piece):
+            remove_piece(piece, stats)
+
+    # Global alpha is indivisible: remove it only when every remaining channel
+    # write is either unobservable or completely overwritten before a read.
+    irrelevant = {"alpha%d" % channel for channel in absent_geometry}
+    if not secondary_read:
+        irrelevant.add("alpha2")
+    killed = set(irrelevant)
+    for part in reversed(parts):
+        if part.kind != "block" or not part.is_override:
+            killed = set(irrelevant)
+            continue
+        for piece in reversed(part.pieces):
+            if piece.kind != "tag" or piece.removed:
+                continue
+            if piece.name == "t":
+                prune_transform_modifiers(piece, lambda child: (
+                    child.name in ("alpha", "1a", "2a", "3a", "4a")
+                    and set(possible_piece_fields(child)) <= killed
+                    and (clean_unknown_tags or classify_tag_piece(child) != "malformed")
+                ), stats)
+            fields = set(possible_piece_fields(piece))
+            if (piece.name in ("alpha", "1a", "2a", "3a", "4a") and fields <= killed
+                    and not piece.pinned and "\\" not in piece.argument
+                    and (clean_unknown_tags or classify_tag_piece(piece) != "malformed")):
+                remove_piece(piece, stats)
+                continue
+            if piece.name in ("alpha", "1a", "2a", "3a", "4a") and "\\" not in piece.argument:
+                killed.update(fields)
+            else:
+                killed.difference_update(fields - irrelevant)
+
+
+def optimize_static_lifetimes(
+    parts: list[TextPart], initial: dict[str, str], styles: dict[str, AssStyle],
+    style_name: str, wrap_style: int, clean_unknown_tags: bool, stats: TextCleanStats,
+) -> None:
+    if not clean_unknown_tags:
+        pin_policy_boundaries(parts, initial, styles, style_name, wrap_style)
+    state = dict(initial)
+    index = 0
+    while index < len(parts):
+        end = index + 1
+        if parts[index].kind == "block" and parts[index].is_override:
+            while end < len(parts) and parts[end].kind == "block" and parts[end].is_override:
+                end += 1
+            pieces = [piece for block in parts[index:end] for piece in block.pieces]
+            state = optimize_static_group(pieces, state, styles, style_name, wrap_style,
+                                          clean_unknown_tags, stats)
+        index = end
+
+
+def _clean_ass_text_once(
     text: str,
     style_name: str,
     styles: dict[str, AssStyle],
@@ -2246,6 +3318,14 @@ def clean_ass_text(
     if not style:
         return render_text_parts(parts, stats), stats
     initial = style_state(style, wrap_style)
+
+    coalesce_parseable_override_parts(parts, initial, styles, style_name, wrap_style)
+
+    optimize_static_lifetimes(parts, initial, styles, style_name, wrap_style,
+                              clean_unknown_tags, stats)
+
+    remove_time_dominated_modifiers(parts, initial, styles, style_name, wrap_style,
+                                    event_duration_ms, stats)
 
     mark_first_wins(parts, initial, styles, style_name, wrap_style, stats)
     remove_identity_transforms(
@@ -2322,6 +3402,9 @@ def clean_ass_text(
         stats,
     )
 
+    remove_unobservable_channel_modifiers(parts, initial, styles, style_name, wrap_style,
+                                         clean_unknown_tags, stats)
+
     stats.normalized_numbers += normalize_drawing_parts(
         parts, initial, styles, style_name, wrap_style
     )
@@ -2346,13 +3429,12 @@ def clean_ass_text(
                 clip_count,
             )
             for piece in part.pieces:
-                if piece.kind != "tag" or piece.removed or piece.name == "t":
+                if piece.kind != "tag" or piece.removed:
                     continue
                 action = action_for_piece(
                     piece, reorder_state, styles, style_name, wrap_style
                 )
-                if action.valid:
-                    apply_action(reorder_state, action)
+                apply_action(reorder_state, action)
 
     result = render_text_parts(parts, stats, styles, style_name, wrap_style)
     if result != text:
@@ -2362,6 +3444,91 @@ def clean_ass_text(
             stats.normalized_numbers += second_normalized
             result = render_text_parts(second_parts, TextCleanStats())
     return result, stats
+
+
+def clean_ass_text(
+    text: str, style_name: str, styles: dict[str, AssStyle], *, wrap_style: int = 0,
+    safe_reorder: bool = False, clean_unknown_tags: bool = False,
+    event_duration_ms: int | None = None,
+) -> tuple[str, TextCleanStats]:
+    """Reach a semantic fixed point without a round limit or renderer dependency."""
+    total = TextCleanStats()
+    current = text
+    seen: set[str] = set()
+    converged = False
+    while current not in seen:
+        seen.add(current)
+        result, stats = _clean_ass_text_once(
+            current, style_name, styles, wrap_style=wrap_style,
+            safe_reorder=safe_reorder, clean_unknown_tags=clean_unknown_tags,
+            event_duration_ms=event_duration_ms,
+        )
+        total.add(stats)
+        total.unsupported_tags = stats.unsupported_tags
+        total.renderer_specific_tags = stats.renderer_specific_tags
+        if result == current:
+            converged = True
+            break
+        current = result
+    def final_tokens(value: str) -> list[TagPiece]:
+        output = []
+        def visit(piece: TagPiece, depth: int = 0) -> None:
+            output.append(piece)
+            parsed = transform_arguments(piece.argument) if piece.name == "t" and depth < 16 else None
+            if parsed is not None:
+                for child in split_override_content(parsed[1]):
+                    if child.kind == "tag": visit(child, depth + 1)
+        for piece in iter_tag_pieces(parse_text_parts(value)): visit(piece)
+        return output
+    original = final_tokens(text)
+    remaining = final_tokens(current)
+    def absolute_font_writes(value: str) -> collections.Counter:
+        counts: collections.Counter = collections.Counter()
+        span = 0
+        for part in parse_text_parts(value):
+            if part.kind == "text" and part.raw:
+                span += 1
+            elif part.kind == "block" and part.is_override:
+                for piece in part.pieces:
+                    if piece.name == "fs" and not piece.argument.startswith(("+", "-")):
+                        number = canonical_decimal(piece.argument)
+                        if number is not None: counts[span, number] += 1
+        return counts
+    total.folded_font_chains = min(total.folded_font_chains, sum(
+        (absolute_font_writes(current) - absolute_font_writes(text)).values()))
+    before_labels = collections.Counter("\\" + (piece.name or "?") for piece in original)
+    after_labels = collections.Counter("\\" + (piece.name or "?") for piece in remaining)
+    # Derive deletion totals from the final artifact, not attempted removals
+    # during repeated passes. A rewritten fs is still one retained tag.
+    total.removed_tag_labels = list((before_labels - after_labels).elements())
+    total.removed_tags = len(total.removed_tag_labels)
+    total.removed_malformed_tags = max(0, sum(classify_tag_piece(piece) == "malformed" for piece in original)
+                                     - sum(classify_tag_piece(piece) == "malformed" for piece in remaining))
+    def unknown_labels(pieces: list[TagPiece]) -> collections.Counter:
+        return collections.Counter(unsupported_tag_label(piece.raw) or ("\\" + (piece.name or "?"))
+                                   for piece in pieces if classify_tag_piece(piece) == "unknown")
+    total.removed_unknown_tag_labels = list((unknown_labels(original) - unknown_labels(remaining)).elements())
+    total.removed_unknown_tags = len(total.removed_unknown_tag_labels)
+    opaque = any(part.kind == "block" and not part.is_override
+                 and re.fullmatch(r"(?:=\d+)+", part.raw) is None
+                 for part in parse_text_parts(current))
+    unmodeled = style_name not in styles
+    if not unmodeled:
+        trial = style_state(styles[style_name], wrap_style)
+        unmodeled = "?" in trial.values()
+        for part in parse_text_parts(current):
+            if part.kind == "block" and part.is_override:
+                for piece in part.pieces:
+                    if piece.kind == "tag":
+                        action = action_for_piece(piece, trial, styles, style_name, wrap_style)
+                        unmodeled = unmodeled or not action.valid or bool(action.unknown_fields)
+                        apply_action(trial, action)
+    total.minimality = ("unproven" if not converged or opaque or total.renderer_specific_tags or unmodeled
+                       else "policy-limited" if not clean_unknown_tags and any(
+        classify_tag_piece(piece) in ("unknown", "malformed") for piece in remaining
+    ) else "unproven" if any(piece.name == "t" or classify_tag_piece(piece) in ("unknown", "malformed")
+                            for piece in remaining) else "modeled-fixed-point")
+    return current, total
 
 
 def render_text_parts(
@@ -2393,6 +3560,13 @@ def render_text_parts(
             end += 1
         contents = [block.content() for block in blocks if block.content()]
         removed_blocks = sum(1 for block in blocks if not block.content())
+        preserve_boundary = bool(
+            index > 0 and parts[index - 1].kind == "text" and parts[index - 1].raw
+            and end < len(parts) and parts[end].kind == "text" and parts[end].raw
+        )
+        if not contents and preserve_boundary:
+            output.append("{}")
+            removed_blocks = max(0, removed_blocks - 1)
         stats.removed_blocks += removed_blocks
         can_merge = bool(styles and state) and all(
             block_can_merge(block, state, styles, style_name, wrap_style) for block in blocks
@@ -2404,11 +3578,10 @@ def render_text_parts(
         if styles and state:
             for block in blocks:
                 for piece in block.pieces:
-                    if piece.kind != "tag" or piece.removed or piece.name == "t":
+                    if piece.kind != "tag" or piece.removed:
                         continue
                     action = action_for_piece(piece, state, styles, style_name, wrap_style)
-                    if action.valid:
-                        apply_action(state, action)
+                    apply_action(state, action)
         index = end
     return "".join(output)
 
@@ -2501,11 +3674,21 @@ def event_collision_layer(event: AssEvent) -> str:
     return value if value is not None else "0"
 
 
+def document_has_unparsed_event_headers(document: AssDocument) -> bool:
+    parsed = {event.line_index for event in document.events}
+    return any(
+        index not in parsed and re.match(r"(?i)^(?:dialogue|comment)\s*:", line.lstrip())
+        for index, line in enumerate(document.lines)
+    )
+
+
 def fully_transparent_events_safe_to_remove(
     document: AssDocument,
     clean_unknown_tags: bool,
 ) -> list[AssEvent]:
     """Find invisible events whose deletion cannot alter collision placement."""
+    if document_has_unparsed_event_headers(document):
+        return []
     dialogues = [event for event in document.events if event.kind == "Dialogue"]
     transparent = {
         id(event)
@@ -2571,17 +3754,138 @@ def event_has_time_relative_content(event: AssEvent) -> bool:
 
 
 def event_has_explicit_position(event: AssEvent) -> bool:
-    for piece in iter_tag_pieces(parse_text_parts(event.text)):
-        if piece.name in ("pos", "move") and normalize_parenthesized_tag(
-            piece.name, piece.argument
-        ):
-            return True
-    return False
+    return effective_position_family(parse_text_parts(event.text)) is not None
+
+
+def event_text_has_unambiguous_override_structure(
+    parts: Sequence[TextPart],
+) -> bool:
+    """Reject broken braces and mixed comment/override blocks.
+
+    Ordinary brace comments are harmless, but a block containing both literal
+    text and override tags is renderer-sensitive and cannot safely drive an
+    event-field rewrite.
+    """
+    for part in parts:
+        if part.kind == "text":
+            if find_unescaped_open_brace(part.raw, 0) >= 0 or "}" in part.raw:
+                return False
+            continue
+        if not part.is_override and any(piece.kind == "tag" for piece in part.pieces):
+            return False
+    return True
+
+
+def effective_position_family(parts: Sequence[TextPart]) -> str | None:
+    """Resolve first-wins positioning only across fully understood position writes."""
+    if not event_text_has_unambiguous_override_structure(parts):
+        return None
+    first_position: str | None = None
+    for piece in iter_tag_pieces(parts):
+        if piece.removed:
+            continue
+        if piece.name not in ("pos", "move"):
+            if "line_position" in possible_piece_fields(piece):
+                return None
+            continue
+        if normalize_parenthesized_tag(piece.name, piece.argument) is None:
+            return None
+        if first_position is None:
+            first_position = piece.name
+    return first_position
+
+
+def effective_position_is_pos(parts: Sequence[TextPart]) -> bool:
+    return effective_position_family(parts) == "pos"
+
+
+def effective_wrap_style_for_margin_cleanup(
+    parts: Sequence[TextPart],
+    script_wrap_style: int,
+) -> int | None:
+    """Resolve the last strict q0-q3, or return None for ambiguous q syntax."""
+    effective = script_wrap_style
+    for piece in iter_tag_pieces(parts):
+        if piece.removed:
+            continue
+        if piece.name != "q":
+            if "wrap_style" in possible_piece_fields(piece):
+                return None
+            continue
+        if piece.argument not in ("0", "1", "2", "3"):
+            return None
+        effective = int(piece.argument)
+    return effective
+
+
+def event_is_provably_pure_drawing(parts: Sequence[TextPart]) -> bool:
+    """Prove that every non-empty renderable span is interpreted as drawing data."""
+    drawing_scale = 0
+    saw_drawing = False
+    for part in parts:
+        if part.kind == "text":
+            if not part.raw:
+                continue
+            if drawing_scale <= 0:
+                return False
+            saw_drawing = True
+            continue
+        if not part.is_override:
+            continue
+        for piece in part.pieces:
+            if piece.kind != "tag" or piece.removed:
+                continue
+            if piece.name != "p":
+                if "p" in possible_piece_fields(piece):
+                    return False
+                continue
+            number = integer_truncated(piece.argument)
+            if number is None:
+                return False
+            drawing_scale = max(0, int(number))
+    return saw_drawing
+
+
+def clear_ineffective_positioned_margins(
+    event: AssEvent,
+    script_wrap_style: int,
+) -> list[EventFieldChange]:
+    """Clear only event margins proven inert in both target renderers."""
+    if event.kind not in ("Dialogue", "Comment") or event.get("Effect").strip():
+        return []
+    parts = parse_text_parts(event.text)
+    if not event_text_has_unambiguous_override_structure(parts):
+        return []
+    if not effective_position_is_pos(parts):
+        return []
+
+    fields = ["MarginV"]
+    wrap_style = effective_wrap_style_for_margin_cleanup(parts, script_wrap_style)
+    if wrap_style is not None and (
+        wrap_style == 2 or event_is_provably_pure_drawing(parts)
+    ):
+        fields = ["MarginL", "MarginR", "MarginV"]
+
+    changes: list[EventFieldChange] = []
+    for field in fields:
+        if event.field_index(field) is None:
+            continue
+        before = event.get(field)
+        if before == "0":
+            continue
+        event.set(field, "0")
+        changes.append(EventFieldChange(field, before, "0"))
+    return changes
 
 
 def event_has_unsupported_override(event: AssEvent) -> bool:
     parts = parse_text_parts(event.text)
     if collect_unsupported_tags(parts):
+        return True
+    if any(
+        "\\" in piece.argument and piece.name != "t"
+        for piece in iter_tag_pieces(parts)
+    ):
         return True
     return any(part.kind == "block" and not part.is_override for part in parts)
 
@@ -2602,6 +3906,8 @@ def overlaps(start_a: int, end_a: int, start_b: int, end_b: int) -> bool:
 
 
 def merge_consecutive_identical_events(document: AssDocument) -> tuple[int, int]:
+    if document_has_unparsed_event_headers(document):
+        return 0, 0
     dialogues = [event for event in document.events if event.kind == "Dialogue"]
     groups: list[list[AssEvent]] = []
     index = 0
@@ -2768,15 +4074,16 @@ def batch_clean_output_path(
 
 def batch_clean_report_path(
     item: SubtitleInput,
-    report_dir: Path | None,
+    report_dir: str | os.PathLike[str] | None,
     report_format: str,
 ) -> Path:
     if report_dir is None:
         return default_clean_report_path(item.path, report_format)
+    report_root = output_root_for_item(item, report_dir)
     relative = subtitle_relative_path(item)
     suffix = ".html" if report_format.casefold() == "html" else ".md"
     return (
-        report_dir
+        report_root
         / relative.parent
         / (relative.stem + ".Clean Report" + suffix)
     ).resolve()
@@ -2855,8 +4162,16 @@ def clean_ass_file(
                 event_duration_ms=duration,
             )
             result.stats.add(line_stats)
-        if working != before:
+        text_changed = working != before
+        if text_changed:
             event.text = working
+        field_changes = (
+            clear_ineffective_positioned_margins(event, document.wrap_style)
+            if options.clean_pos_margins
+            else []
+        )
+        result.margin_fields_cleared += len(field_changes)
+        if text_changed or field_changes:
             document.lines[event.line_index] = event.render()
             if event.kind == "Dialogue":
                 result.changed_dialogues += 1
@@ -2870,6 +4185,7 @@ def clean_ass_file(
                     before=before,
                     after=working,
                     stats=line_stats,
+                    field_changes=field_changes,
                 )
             )
 
@@ -2931,13 +4247,19 @@ def build_clean_report(result: CleanResult) -> str:
         % result.transparent_dialogues_removed,
         "| Removed Comment rows | %d |" % result.comment_lines_removed,
         "| Removed tags | %d |" % result.stats.removed_tags,
+        "| Malformed spellings eliminated | %d |" % result.stats.removed_malformed_tags,
+        "| Integer-result font-size chains folded | %d |" % result.stats.folded_font_chains,
         "| Removed tags unknown to both renderers | %d |" % result.stats.removed_unknown_tags,
         "| Compatibility-safe reordered tags | %d |" % result.stats.reordered_tags,
         "| Normalized numeric/drawing items | %d |" % result.stats.normalized_numbers,
         "| Removed empty override blocks | %d |" % result.stats.removed_blocks,
+        "| Cleared ineffective Margin fields | %d |" % result.margin_fields_cleared,
         "| Removed extradata reference IDs | %d |" % result.marker_references_removed,
         "| Merged consecutive identical groups | %d |" % result.merged_groups,
         "| Dialogue rows removed by merging | %d |" % result.merged_lines,
+        "",
+        "Cleanup reaches a modeled fixed point. This report does not independently certify global minimality; "
+        "rendering PASS, when available, validates the compared frames separately.",
         "",
         "## File-level metadata",
         "",
@@ -2981,7 +4303,7 @@ def build_clean_report(result: CleanResult) -> str:
         )
     output.extend(["", "## Change details", ""])
     if not result.changes:
-        output.append("No subtitle event text was modified.")
+        output.append("No subtitle event text or fields were modified.")
     for change in result.changes:
         output.extend(
             [
@@ -3008,6 +4330,8 @@ def build_clean_report(result: CleanResult) -> str:
             output.extend(
                 ["- Compatibility-safe reorder: %d tags moved." % change.stats.reordered_tags, ""]
             )
+        if change.stats.folded_font_chains:
+            output.extend(["- Integer-result font-size chains folded: %d." % change.stats.folded_font_chains, ""])
         if change.stats.normalized_numbers:
             output.extend(
                 ["- Normalized items: %d." % change.stats.normalized_numbers, ""]
@@ -3019,22 +4343,35 @@ def build_clean_report(result: CleanResult) -> str:
                     "",
                 ]
             )
-        output.extend(
-            [
-                "Before:",
-                "",
-                markdown_code(change.before),
-                "",
-                "After:",
-                "",
-                (
-                    "**Dialogue row removed.**"
-                    if change.removed_event
-                    else markdown_code(change.after)
-                ),
-                "",
-            ]
-        )
+        for field_change in change.field_changes:
+            output.extend(
+                [
+                    "- Event field `%s`: `%s` → `%s`."
+                    % (
+                        field_change.name,
+                        field_change.before.replace("`", "\\`"),
+                        field_change.after.replace("`", "\\`"),
+                    ),
+                    "",
+                ]
+            )
+        if change.removed_event or change.before != change.after:
+            output.extend(
+                [
+                    "Before:",
+                    "",
+                    markdown_code(change.before),
+                    "",
+                    "After:",
+                    "",
+                    (
+                        "**Dialogue row removed.**"
+                        if change.removed_event
+                        else markdown_code(change.after)
+                    ),
+                    "",
+                ]
+            )
     return "\n".join(output).rstrip() + "\n"
 
 
@@ -5433,6 +6770,7 @@ def resolve_clean_args(
         "recursive": False,
         "safe_reorder": True,
         "merge_lines": True,
+        "clean_pos_margins": True,
         "clean_comments": False,
         "remove_transparent_dialogues": False,
         "clean_unknown_tags": True,
@@ -5528,6 +6866,7 @@ def clean_settings_data(args: argparse.Namespace) -> dict[str, Any]:
         "backup": not bool(args.no_backup),
         "safe_reorder": bool(args.safe_reorder),
         "merge_lines": bool(args.merge_lines),
+        "clean_pos_margins": bool(args.clean_pos_margins),
         "clean_comments": bool(args.clean_comments),
         "remove_transparent_dialogues": bool(args.remove_transparent_dialogues),
         "clean_unknown_tags": bool(args.clean_unknown_tags),
@@ -5619,6 +6958,15 @@ def parse_clean_args(argv: Sequence[str]) -> argparse.Namespace:
         help="Merge consecutive identical static Dialogue rows; enabled by default",
     )
     parser.add_argument(
+        "--clean-pos-margins",
+        action=argparse.BooleanOptionalAction,
+        default=None,
+        help=(
+            "Clear event margins proven ineffective for valid positioned Dialogue and Comment rows; "
+            "enabled by default"
+        ),
+    )
+    parser.add_argument(
         "--clean-comments",
         action=argparse.BooleanOptionalAction,
         default=None,
@@ -5639,7 +6987,7 @@ def parse_clean_args(argv: Sequence[str]) -> argparse.Namespace:
         dest="clean_unknown_tags",
         action=argparse.BooleanOptionalAction,
         default=None,
-        help="Remove override tags unknown to both libass and xy-VSFilter; enabled by default",
+        help="Remove proven-ineffective unknown or malformed override tags; enabled by default",
     )
     parser.add_argument(
         "--clean-extradata-references",
@@ -5666,7 +7014,10 @@ def parse_clean_args(argv: Sequence[str]) -> argparse.Namespace:
     )
     report_destination.add_argument(
         "--report-dir",
-        help="Batch report directory; preserves relative directory structure under selected directories",
+        help=(
+            "Batch report directory. An absolute path is a shared root; a relative path is resolved from each "
+            "input file or selected directory while preserving relative directory structure"
+        ),
     )
     parser.add_argument(
         "--write-reports",
@@ -5757,6 +7108,7 @@ def run_clean_namespace(args: argparse.Namespace) -> tuple[int, CleanResult, Pat
         options = CleanOptions(
             safe_reorder=args.safe_reorder,
             merge_lines=args.merge_lines,
+            clean_pos_margins=getattr(args, "clean_pos_margins", True),
             clean_comments=getattr(args, "clean_comments", False),
             remove_transparent_dialogues=getattr(
                 args, "remove_transparent_dialogues", False
@@ -5830,7 +7182,13 @@ def run_clean_batch_namespace(
     global GUI_PROGRESS_CALLBACK
     if any(
         getattr(args, key, None) is None
-        for key in ("recursive", "safe_reorder", "report_format", "render_workers")
+        for key in (
+            "recursive",
+            "safe_reorder",
+            "clean_pos_margins",
+            "report_format",
+            "render_workers",
+        )
     ):
         args = resolve_clean_args(args)
     raw_inputs = list(getattr(args, "inputs", ()))
@@ -5853,7 +7211,7 @@ def run_clean_batch_namespace(
         raise ValueError("--report cannot be used with multiple subtitle or directory inputs; use --report-dir")
 
     output_dir = output_dir_value if output_dir_value else None
-    report_dir = Path(report_dir_value).resolve() if report_dir_value else None
+    report_dir = report_dir_value if report_dir_value else None
     report_format = str(getattr(args, "report_format", "html")).casefold()
     if report_format not in ("md", "html"):
         raise ValueError("Report format must be md or html")
@@ -6035,6 +7393,9 @@ def launch_gui() -> int:
         "recursive": tk.BooleanVar(value=config.get("recursive", False)),
         "safe_reorder": tk.BooleanVar(value=config.get("safe_reorder", True)),
         "merge_lines": tk.BooleanVar(value=config.get("merge_lines", True)),
+        "clean_pos_margins": tk.BooleanVar(
+            value=config.get("clean_pos_margins", True)
+        ),
         "clean_comments": tk.BooleanVar(value=config.get("clean_comments", False)),
         "remove_transparent_dialogues": tk.BooleanVar(
             value=config.get("remove_transparent_dialogues", False)
@@ -6263,6 +7624,10 @@ def launch_gui() -> int:
     checks = (
         ("safe_reorder", "Compatibility-safe tag reordering"),
         ("merge_lines", "Merge consecutive identical static Dialogue rows"),
+        (
+            "clean_pos_margins",
+            "Clear ineffective margins on positioned lines",
+        ),
         ("clean_comments", "Remove Comment event rows from [Events]"),
         (
             "remove_transparent_dialogues",
@@ -6270,7 +7635,7 @@ def launch_gui() -> int:
         ),
         (
             "clean_unknown_tags",
-            "Remove override tags unknown to both libass and xy-VSFilter",
+            "Remove proven-ineffective unknown or malformed override tags",
         ),
         ("clean_refs", "Remove leading {=number} extradata references from events"),
         ("clean_project", "Remove [Aegisub Project Garbage]"),
@@ -6377,6 +7742,7 @@ def launch_gui() -> int:
             no_backup=False,
             safe_reorder=variables["safe_reorder"].get(),
             merge_lines=variables["merge_lines"].get(),
+            clean_pos_margins=variables["clean_pos_margins"].get(),
             clean_comments=variables["clean_comments"].get(),
             remove_transparent_dialogues=variables[
                 "remove_transparent_dialogues"
@@ -6450,14 +7816,16 @@ def launch_gui() -> int:
             try:
                 code, batch = run_clean_batch_namespace(namespace)
                 message = (
-                    "Complete: %d files succeeded, %d failed; %d rows modified, %d tags removed, "
-                    "%d always-transparent Dialogue rows removed, %d Comment rows removed, "
-                    "and %d extradata references removed."
+                    "Complete: %d files succeeded, %d failed; %d rows modified, %d tags removed, %d font-size chains folded, "
+                    "%d ineffective Margin fields cleared, %d always-transparent Dialogue rows removed, "
+                    "%d Comment rows removed, and %d extradata references removed."
                     % (
                         batch.succeeded,
                         batch.failed,
                         batch.changed_dialogues,
                         batch.removed_tags,
+                        batch.folded_font_chains,
+                        batch.margin_fields_cleared,
                         batch.removed_transparent_dialogues,
                         batch.removed_comment_lines,
                         batch.removed_extradata_references,
@@ -6527,6 +7895,8 @@ def main(argv: Sequence[str]) -> int:
         print("FAILED=%d" % batch.failed)
         print("CHANGED_DIALOGUES=%d" % batch.changed_dialogues)
         print("REMOVED_TAGS=%d" % batch.removed_tags)
+        print("FOLDED_FONT_CHAINS=%d" % batch.folded_font_chains)
+        print("CLEARED_MARGINS=%d" % batch.margin_fields_cleared)
         print(
             "REMOVED_TRANSPARENT_DIALOGUES=%d"
             % batch.removed_transparent_dialogues

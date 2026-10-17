@@ -6,7 +6,7 @@
 
 [查看脚本](ass_clean_redundant_tags.py)
 
-清理 ASS/SSA 中不改变有效状态的 override 标签、显示前已被覆盖的写入和无意义数值格式。工具还可以按需删除能够证明不影响碰撞布局的始终透明 Dialogue 行、执行兼容安全重排、合并连续相同的静态 Dialogue、清理 Aegisub 文件级元数据、生成审计报告，并分别使用 libass 与 xy‑VSFilter 验证清理前后的真实渲染结果。
+清理 ASS/SSA 中不改变有效状态的 override 标签、显示前已被覆盖的写入、无意义数值格式，以及能够证明在 `\pos` 下无效的事件 Margin。工具还可以按需删除能够证明不影响碰撞布局的始终透明 Dialogue 行、执行兼容安全重排、合并连续相同的静态 Dialogue、清理 Aegisub 文件级元数据、生成审计报告，并分别使用 libass 与 xy‑VSFilter 验证清理前后的真实渲染结果。
 
 脚本的图形界面、命令行帮助、进度信息、错误信息和生成报告使用英语；本文提供简体中文使用说明。
 
@@ -70,9 +70,10 @@ python ass_clean_redundant_tags.py [clean] <输入文件或目录> [其他设置
 | 替换原文件 | `--in-place`；不创建备份再加 `--no-backup` |
 | 兼容安全重排 | `--safe-reorder` |
 | 合并连续相同行 | `--merge-lines` |
+| 清理定位行中无效的 Margin | `--clean-pos-margins`；默认开启 |
 | 删除 Comment 事件行 | `--clean-comments`；默认关闭 |
 | 删除始终透明的 Dialogue 行 | `--remove-transparent-dialogues`；默认关闭 |
-| 删除两端未知标签 | `--clean-unknown-tags` |
+| 删除已证明无效的未知或畸形标签 | `--clean-unknown-tags` |
 | 删除 extradata 引用 | `--clean-extradata-references` |
 | 删除 Project Garbage | `--clean-project-garbage` |
 | 删除 Extradata 段 | `--clean-extradata` |
@@ -135,9 +136,10 @@ python ass_clean_redundant_tags.py
 - 输出文件夹，可填写绝对路径或相对路径
 - 兼容安全重排标签
 - 合并连续相同的静态 Dialogue
+- 清理能够安全分析的 `\pos` Dialogue 与 Comment 事件中的无效 Margin
 - 删除 `[Events]` 中的 Comment 事件行
 - 删除能够证明不影响碰撞布局的始终透明 Dialogue 行
-- 删除 libass 与 xy‑VSFilter 均不识别的 override 标签
+- 删除已证明无效的未知或畸形 override 标签
 - 删除事件开头的 `{=数字}` extradata 引用
 - 删除 `[Aegisub Project Garbage]`
 - 删除 `[Aegisub Extradata]`
@@ -218,7 +220,7 @@ python ass_clean_redundant_tags.py clean "input.ass" `
 
 ### 清理选项示例
 
-安全重排、连续行合并、两端未知 override 标签清理、HTML 报告、三类 Aegisub 元数据清理和 libass 对比均默认启用；Comment 行删除、始终透明 Dialogue 行删除和 xy‑VSFilter 对比默认关闭：
+安全重排、连续行合并、已证明无效的未知或畸形 override 标签清理、HTML 报告、三类 Aegisub 元数据清理和 libass 对比均默认启用；Comment 行删除、始终透明 Dialogue 行删除和 xy‑VSFilter 对比默认关闭：
 
 ```powershell
 python ass_clean_redundant_tags.py clean "input.ass"
@@ -226,7 +228,7 @@ python ass_clean_redundant_tags.py clean "input.ass"
 
 默认启用项均可用对应的 `--no-*` 参数关闭；需要 xy‑VSFilter 对比时添加 `--compare-vsfilter`。
 
-删除两套目标渲染器均不识别的标签：
+删除已证明无效的未知或畸形 override 标签：
 
 ```powershell
 python ass_clean_redundant_tags.py clean "input.ass" `
@@ -267,11 +269,12 @@ python ass_clean_redundant_tags.py clean "input.ass" --in-place
 | 整个 Dialogue 行始终透明 | 完整 Dialogue 事件 | 已启用 `remove_transparent_dialogues`，每个实际文字/绘图区间的四通道都能确定为 `&HFF&`，没有 alpha transform 恢复可见，且删除事件不会改变碰撞布局 | 选项未启用、任一区间可能可见、语法不透明，或同层未定位碰撞组中还包含可见事件 |
 | first-wins 行级属性 | `\pos`/`\move`、`\org`、`\fad`/`\fade`、`\an`/`\a` | 同族第一个有效标签已经决定整行，后续同族有效标签无效；首个 alignment 等于 Style 时也可删除 | 首个有效几何/fade 标签保留；畸形写法形成保守边界 |
 | 重复 Style reset | `\r`、`\rStyleName` | 同一 reset 目标在文字显示前重复，且后一个 reset 不改变任何有效字段 | reset 切换到不同 Style、清除中间修改，或位于已经显示的文字之后 |
-| identity、重复目标或时间上无效的 transform | `\t(...)` | 已解析 modifier 均不改变字段、后一个显式 transform 在同字段相同目标已经稳定后才开始、确定性静态/reset 写入已经提供该目标、modifier 清理后为空，或动画在事件结束时/之后才开始 | 目标不同、区间重叠、时间倒序、中间写入改变该字段，或无法完整解析 |
+| 重复目标或时间上无效的 transform | `\t(...)` | 支持的瞬时写入重复稳定目标，或恒定结果/未来时间证明使 modifier 无效；仍需保留事件级布局作用 | 未证明原生恒定结果的非零时长同值插值、动态或未知起点、不同目标、未解析的重叠/倒序，以及删除未定位事件中的最后一个 transform |
 | libass 与 xy‑VSFilter 均未知 | 未知 override 标签，以及 `\t` 内可安全拆分的未知 modifier | 启用 `clean_unknown_tags`，且确认该 token 不在两端兼容集合中 | 任一渲染器支持，或其语法/位置无法安全隔离 |
 | karaoke 时序 | `\k`、`\K`、`\kf`、`\ko`、`\kt` | 不会仅因数值看似无效就删除 | 作为时序/文本解释状态保留；数值仍可规范化，标签仍可做兼容安全重排 |
 | clip 与绘图数据 | `\clip`、`\iclip`、`\p` 绘图路径 | 会规范化无意义小数零和绘图 token 写法，不会仅凭几何猜测删除未使用 clip | 无法从静态字段等值证明 clip 语义或绘图可见性时保留 |
-| 清理后变空或彼此相邻的 override block | `{\redundant}`、`{\tag1}{\tag2}` | 块内 override 标签全部删除后移除该块；相邻块均可解析且中间没有保守边界时合并 | 字面 comment、畸形内容、渲染器特有 HTML 状态或其他不透明内容会保留块或边界 |
+| 使用 `\pos` 的事件 Margin | Dialogue 与 Comment 的 `MarginL`、`MarginR`、`MarginV` | 有效 `\pos` 会使 `MarginV` 无效；最终 `WrapStyle=2` 或能够证明全为绘图时，左右 Margin 也无效 | `WrapStyle=0/1/3` 的普通换行文字、`\move`、非空 Effect、畸形或含糊语法 |
+| 清理后变空或彼此相邻的 override block | `{\redundant}`、`{\tag1}{\tag2}` | 不承担显示边界作用的空块会删除；相邻且中间没有内容的可解析块可以合并 | 两个非空片段之间，标签清空后保留 `{}`，以维持绘图对象和文字 shaping 分段；comment 与不确定语法也保留边界 |
 
 表中的“清理”始终以 libass 与 xy‑VSFilter 各自的有效标签状态不变为前提，并不表示所有文本相同的重复标签都会删除。
 
@@ -307,9 +310,53 @@ python ass_clean_redundant_tags.py clean "input.ass" --in-place
 例句
 ```
 
+### 删减范围、裸标签与相对字号
+
+清理结合前向状态传播和反向读写分析。在任何文字读取前，后面的完整赋值可以清掉前面的整组写入，包括相对运算或畸形 setter。每次修改后重新分析，直到固定点，不依赖固定轮数。
+
+`clean_unknown_tags` 同时控制已证明无效的畸形已知标签，并不表示“解析失败就删除”。关闭时，畸形 token 及同字段相关写入受保护，无关字段仍可清理；合法裸标签和相对 `\fs` 不受此开关限制。假设 Style 字号为 `24`、描边为 `2`、间距为 `0`：
+
+| 输入 | 开启 | 关闭 |
+| --- | --- | --- |
+| `{\bord4\bordgarbage\bord4}X` | `{\bord4}X` | 原样保留 |
+| `{\fs40\fsbad\fs40}X` | `{\fs40}X` | 原样保留 |
+| `{\fsp5}{\fsp}{\fsp5}X` | `{\fsp5}X` | `{\fsp5}X` |
+| `{\fs40\fs+10\fs40}X` | `{\fs40}X` | `{\fs40}X` |
+
+裸写法逐项分类，分析也覆盖空括号、transform 内和命名 reset 后的情况：
+
+| 类别 | 空参数行为及依赖 |
+| --- | --- |
+| 字体、字号、缩放、间距、Z 旋转、描边/阴影、颜色/透明度、字体标志/编码 | 原生 Style 回退；libass 使用当前 reset Style，xy-VSFilter 使用事件原始 Style |
+| `\frx`、`\fry`、`\fax`、`\fay`、`\blur`、`\be`、`\p`、`\pbo` | 固定回退为零 |
+| `\q` | 回退为 Script Info 的 `WrapStyle` |
+| `\an`、`\a` | alignment 回退，同时消耗 first-wins 状态 |
+| `\r` | 重置到事件原始 Style，包括清除前序字段动画状态 |
+| `\k`、`\K`、`\kf`、`\ko`；`\kt` | 保留 karaoke 时间线作用；裸时长为 100 cs，`\kt` 为零 |
+| 位置/原点、fade、clip、`\t` | 分别解析参数和结构/布局作用，不能统一视为空操作 |
+
+例如 `\rAlt` 后的裸 `\fs`，两端的回退字号可能不同，程序分别跟踪，不能共用一个活动 Style 值。
+
+紧邻 `\fs` 的正负号表示相对运算：`\fs+n`、`\fs-n` 将当前字号乘以 `1+n/10`、`1-n/10`，其他数值标签不套用这个公式。`\fs +1` 不等于相对写法 `\fs+1`，中间的空白不会被误删。
+
+优化主要删减已有写入，不合成描边或透明度等替代标签。唯一例外是：两个及以上静态字号写入，在两端原生计算顺序下均得到相同正整数时，可改写保留下来的一个 `\fs`；中间值不提前舍入：
+
+| 字号链 | 结果 |
+| --- | --- |
+| `\fs40\fs+1` | `\fs44` |
+| `\fs40\fs-1` | `\fs36` |
+| `\fs40\fs+10` | `\fs80` |
+| `\fs33\fs+1` | 保留最终为小数的字号链 |
+| `\fs40\fs+1\fs-1` | `\fs44\fs-1`；只整合整数前缀，最终仍为 39.6 |
+| `\fs33\fs+1\fs40` | 后写入完整覆盖，得到 `\fs40` |
+
+表中假定初始字号不等于最终所需字号。若整条链恢复了原有效状态，优先直接删除整条链；不跨显示内容、reset、相关动画或未知写入整合。报告分别统计整数字号整合次数和实际删除标签数。
+
+“渲染等价”“已达到分析模型的固定点”“当前策略下最简”是不同结论。渲染 PASS 和幂等性不能单独证明最简；开发审计会独立枚举允许的标签/modifier 删减子集及整数字号候选。无法证明的语法安全保留，并标为“最简性未证实”，不宣称已经充分精简。必要的 `{}` 分段与动画/碰撞作用必须保留。
+
 ### 复杂状态案例
 
-以下案例假定 `Default` Style 的 `ScaleX=100`、主色为白色且主透明度为 `&H80&`、`Outline=2`、`Shadow=0`；`Alt` Style 的 `ScaleX=80`、`ScaleY=100`、粗体开启、主色为 `&HFF0000&`、`Outline=3`、`Shadow=1`。
+以下案例假定 `Default` Style 的 `ScaleX=100`、主色为白色且主透明度为 `&H80&`、`Outline=2`、`Shadow=0`；`Alt` Style 的 `Fontsize=40`、`ScaleX=80`、`ScaleY=100`、粗体开启、主色为 `&HFF0000&`、`Outline=3`、`Shadow=1`。
 
 同一显示边界前同时存在死写入、Style 等值标签、first-wins 几何标签和小数格式时：
 
@@ -354,6 +401,8 @@ Style reset 与 transform 同时出现时，程序先切换活动 Style，再按
 首个 `\blur200` 和 `\fscx60` 分别影响已经显示的 `A`、`B`，不能因后续出现相同值而删除；两个 reset 也必须保留，因为它们分别决定 `C`、`D` 的 Style。只有当前状态下确实不再产生作用的重复写入和 Style 等值标签会被移除。
 
 ### 完全透明通道的颜色标签
+
+没有卡拉 OK 时间线读取副色时，`\2c`、`\2a` 也可清理。全局 `\alpha` 只有在它写入的每个通道都不可观察或在使用前被覆盖时才会整体删除，不会合成为新的单通道标签。全程不可见的内容可清理绘制字段；字体与几何字段还需要独立定位，才能排除碰撞布局影响。
 
 当 `\c` / `\1c`–`\4c` 对应的 `\alpha` 或 `\1a`–`\4a` 通道在该颜色写入的完整生命周期内都能确定为 `&HFF&` 时，程序会删除这个颜色标签。判断会继续跟踪后续文字、单通道透明度覆盖、替代颜色和 `\r`，而不只检查同一个 override block。例如：
 
@@ -431,26 +480,30 @@ python ass_clean_redundant_tags.py clean "input.ass" --remove-transparent-dialog
 
 ### 两端未知标签
 
-两端未知 override 标签清理默认启用。程序会删除能够确认位于 override block 中、且 libass 与 xy‑VSFilter 均不识别的标签；需要保守保留时使用 `--no-clean-unknown-tags`：
+已证明无效的未知或畸形 override token 清理默认启用。需要保留这些 token 及相关字段写入时使用 `--no-clean-unknown-tags`：
 
 ```ass
 {\zunknown1\fs60}Text  →  {\fs60}Text
 ```
 
-简单 `\t(...)` modifier 中的未知标签也会删除；如果 transform 删除后不再包含任何有效 modifier，空 transform 会一并删除。
+简单 `\t(...)` modifier 中能够安全隔离的未知标签也可以删除；如果剩下空 transform，仍会先检查它对事件动画和碰撞布局的作用。
 
 以下内容不会因此删除：
 
-- libass 或 xy‑VSFilter 至少一端支持的标签
-- 已知标签名称后带有畸形参数的写法
+- libass 或 xy‑VSFilter 至少一端支持且仍有作用的标签
+- 无法证明无效或被完整覆盖的畸形已知 setter
 - 能够确认为普通 brace comment 的块中、看起来像反斜杠命令的文本
 - 无法安全拆分的复杂 transform 内容
 
-ASS 标签名没有独立终止符，因此只要原始 token 以某个已知短标签开头，就按“已知标签加畸形参数”保留。例如 `\unknown` 以有效的 `\u` 开头，不会仅凭后续字母被当成可安全删除的未知标签。这一规则会少删，但能避免把两套渲染器可能部分解析的 token 误删。
+ASS 标签名没有独立终止符。原始 token 以已知短标签开头时，按该 setter 分析，而不是当成无效的未知名称。例如 `\unknown` 以 `\u` 开头，不能仅因后续还有字母就删除；但后面的完整覆盖仍可能证明它没有剩余作用。
+
+未知外层标签中包含反斜杠时，例如 `\z(abc(\b1)\i1)`，通常保留原文，因为渲染器仍可能执行内部标签。只有极有限的内部字体标志组合，在“执行写入”和“两端 Style 回退”都能证明为空操作时才会删除。括号含糊或无法建模的结构继续保留。已验证的简单标量前缀可建立原生值，但不擅自改写其畸形拼写；其他不确定写入会使相关值失效。颜色/透明度参数前的空白，例如 `\c &HFF&`，不会被当成无空白写法的等价参数。数值规范化也不会舍入超长小数，或擅自删除未验证的 Unicode 空白。
 
 “两端未知”只针对本程序维护的 libass 与 xy‑VSFilter 兼容性集合。其他渲染器、Aegisub 自动化脚本或未来版本仍可能使用这些标签；需要保留此类扩展标签时应关闭该选项。报告会分别列出实际删除的未知标签和仍被保守保留的两端未知标签。
 
 ## 数值与绘图规范化
+
+数值语法只使用 ASCII 数字，不会把全角／阿拉伯数字或未验证的 Unicode 空白改成有效参数。事件文本内的 Unicode 分隔字符仍是文本，不会变成 ASS 换行；含糊的 Style 数值或 Script Info `WrapStyle` 不会建立确定的清理状态。
 
 程序删除不影响数值的前导零、小数点和尾随零：
 
@@ -468,6 +521,8 @@ ASS 标签名没有独立终止符，因此只要原始 token 以某个已知短
 - `\p` 绘图路径坐标
 - vector clip 中的绘图路径
 
+`\be` 保留小数值：`\be1.600` 规范化为 `\be1.6`，不会变成 `\be1`。transform 内同样如此，因为在插值前修改目标值可能改变呈现。粗体、斜体、下划线和删除线的非标准值按实际 Style 回退语义分析，不会把所有非零值都当成启用。
+
 粘连绘图命令会转换为标准空格分隔形式：
 
 ```ass
@@ -480,32 +535,32 @@ m100.00 100.00l200.00 200.00
 m 100 100 l 200 200
 ```
 
-遇到未知 drawing token、无法确定的 `\p` 参数或复杂嵌套表达式时，相关片段保持原样。
+遇到未知 drawing token、大写绘图命令、逗号分隔坐标、无法确定的 `\p` 参数或复杂嵌套表达式时，相关片段保持原样，不会将其改成可能不同的几何图形。
 
 ## transform 安全边界
 
 程序按字段分析简单 `\t`：
 
-- identity transform 可以删除
-- 时间单调且区间不重叠的序列中，后续 transform 重复已经稳定的目标值时可以删除；零时长和非零时长区间都支持
-- 完全落在事件结束时间之后的有效 transform 可以删除
+- 只有目标值相同不足以证明安全：插值、整数取整、动画标志和碰撞布局仍可能改变输出
+- 支持的后续非零时间瞬时 transform，在目标已经稳定且中间没有相关写入时可以删除
+- 空 transform 及完全落在事件结束时间之后的支持的插值，只有在事件级作用也得到保留时才可以删除
 - transform 修改的字段会保护真正改变动画起点的静态状态；transform 之前与当前有效状态相同的写入仍可删除
 - 与 transform 字段无关的静态冗余标签仍可独立删除
-- 嵌套 transform、复杂括号内容和相对字号动画不做字段级语义删除；其中能够独立识别的数值仍会规范化，未知 modifier 仅在启用 `--clean-unknown-tags` 且能够安全拆分时删除
+- 嵌套 transform 和复杂括号内容不做字段级语义拆分。相对字号动画通常保留，但专门的空操作或完整覆盖证明仍可清理，例如已证明无效的 `\fs+0` modifier。其中能够独立识别的数值仍会规范化，未知 modifier 仅在启用 `--clean-unknown-tags` 且能够安全拆分时删除
 
-假设活动 Style 的 `ScaleX=100`、`ScaleY=100`。如果 transform 的目标值仍为当前的 100，动画前后及插值期间的有效值都不发生变化，整个 identity transform 可以删除：
+未定位事件会保留最后一个原有 transform，以维持动画和碰撞行为；即使 `\t()` 也可能改变重叠事件的位置。能够明确确认定位的事件中，空 transform 可以删除：
 
 ```ass
-{\t(0,500,\fscx100)}Text
+{\pos(100,100)\t()}Text
 ```
 
 清理为：
 
 ```ass
-Text
+{\pos(100,100)}Text
 ```
 
-下面的 `\fscy100` 与 transform 无关，也可以删除：
+假设活动 Style 的 `ScaleX=100`、`ScaleY=100`。下面的 `\fscy100` 与 transform 无关，可以删除：
 
 ```ass
 {\fscy100\t(\fscx200)}Text
@@ -541,7 +596,9 @@ Text
 {\1a&HFF&\t(42,42,\1a&HCC&)\t(83,83,\1a&H9A&)\t(250,250,\1a&H00&)}Text
 ```
 
-这项时间轴证明处理带显式起止时间、能够完整解析的绝对 modifier。目标值在 transform 结束时稳定；后续不重叠 transform 再次写入相同值时，无论任一区间是零时长还是非零时长都可以删除。确定性的静态写入或 reset 也会建立新的目标值，因此后续写入相同目标的 transform 同样可以删除。目标不同、区间重叠或时间倒序的当前 transform 会因确实改变输出而保留；等所有已保留区间结束后，其最终目标仍可继续证明更晚的重复写入无效，只有不透明 modifier 才会停止相关字段的后续证明。修改无关字段的 transform 不会阻断判断。字体名、粗体、斜体、下划线、删除线、编码和 `\fsc` 等离散或兼容 modifier 已分别通过 libass 与 xy‑VSFilter 差分，也按相同规则处理。
+这项时间轴证明处理带显式起止时间、能够完整解析的绝对数值、颜色和透明度 modifier。只有起止时间相等且非零的后续瞬时区间，才按重复目标删除。非零时长的重复区间需要另行证明插值及量化等价，不能只比较数学目标。结束时间 `0` 表示事件时长，因此 `\t(0,0,...)` 不是瞬时动画。字体名、粗体、斜体、下划线、删除线、编码、`\be` 和即时兼容重置 `\fsc` 不参与这项时间轴删除证明。前一个动画之后返回 Style 值仍是实际变化；transform 之后用于取消动画状态的 reset 也会保留。
+
+独立的恒定结果证明覆盖二进制精确插值（按 libass 实际缩放单位分析）和稳定的原生 `\be` 量化。例如 `{\fs32\t(0,333,\fs32)}Text` 可成为 `{\fs32\t(0,333,)}Text`，最后一个 transform 仍保留布局标志。无效的未来 modifier 也可删除而保留父标签：时长为 `1000 ms` 时，`{\t(1000,2000,\fscx200)}Text` 可成为 `{\t(1000,2000,)}Text`。起始值未知或非有限数值时，不采用这项未来时间证明。
 
 ### 复杂 transform 案例
 
@@ -568,10 +625,10 @@ Text
 清理为：
 
 ```ass
-{\rAlt\t(0,500,\fs+10\fscy150)\shad1}A
+{\rAlt\t(0,500,\fs+10\fscy150)}A
 ```
 
-第一个 transform 从事件结束时才开始，不会作用于任何生效帧，因此可以删除。第二个 transform 使用依赖当前字号的相对字号动画 `\fs+10`；它之前的 `\fs40`、`\fscx80`、`\fscy100` 和 `\bord3` 都等于 `Alt` Style，可在不改变动画起点的前提下删除。复杂 transform 之后的 `\shad1` 仍位于保守边界内，因此保留。
+第一个 transform 从事件结束时才开始，不会作用于任何生效帧，因此可以删除。第二个 transform 使用依赖当前字号的相对字号动画 `\fs+10`；它之前的 `\fs40`、`\fscx80`、`\fscy100` 和 `\bord3` 都等于 `Alt` Style，可在不改变动画起点的前提下删除。无关的 `\shad1` 也等于 `Alt` Style，因此可以删除。
 
 ## 兼容安全重排
 
@@ -596,7 +653,7 @@ Text
 这不是无条件排序。只有满足以下条件的相邻标签才能交换：
 
 - 两个标签在 libass 与 xy‑VSFilter 下都能被完整解析
-- 完整读写字段集合不相交
+- 完整读写字段集合互相独立，或模拟两种顺序可证明重叠的确定性写入等价
 - first-wins、reset、drawing、karaoke 时间线和 transform 依赖不被破坏
 - 不跨越仍保留的未知标签、普通 comment、畸形参数或复杂表达式
 - `\clip` / `\iclip` 仅在简单 transform 的已解析 modifier 字段不包含 clip 时跨越它；重复 clip 族仍不重排
@@ -612,14 +669,31 @@ Text
 例如：
 
 ```ass
-{\fnExampleFont\an4\fs26\c&H000000&\blur1.5\1a&H78&\pos(119.66,201.29)}
+{\fnExampleFont\an4\fs26\c&H000000&\blur1.5\1a&H78&\pos(119.66,201.29)}Text
 ```
 
 在相应 Style 的主色为黑色时可得到：
 
 ```ass
-{\an4\pos(119.66,201.29)\fnExampleFont\fs26\1a&H78&\blur1.5}
+{\an4\fnExampleFont\fs26\1a&H78&\blur1.5\pos(119.66,201.29)}Text
 ```
+
+## 定位事件的无效 Margin 清理
+
+`clean_pos_margins` 默认开启，可用 `--no-clean-pos-margins` 关闭。Dialogue 与 Comment 都会处理；Comment 使用完全相同的保守规则，因此以后改回 Dialogue 时不会因为这项清理而改变布局。
+
+程序先按 first-wins 规则确认实际生效的位置标签。只有首个有效位置标签为合法 `\pos` 时才继续；遇到 `\move`、畸形位置语法、非空 Effect 或无法明确解析的 override 结构时，三个 Margin 都保持原样。
+
+对于能够安全确认的定位事件：
+
+- `MarginV` 设为 `0`。
+- 仅当最终有效换行模式为 `2`，或所有可渲染内容都能证明处于 `\p>0` 绘图模式时，才把 `MarginL`、`MarginR` 也设为 `0`。
+- 换行模式从 `[Script Info]` 的 `WrapStyle` 开始，随后由最后一个严格有效的 `\q0`–`\q3` 覆盖。含糊或畸形 `\q` 会保留左右 Margin。
+- `WrapStyle=0/1/3` 下的普通文字保留左右 Margin，因为它们仍可能改变自动换行。
+
+出现嵌套或无法确认的绘图/换行状态写入时，包括 `\t(\p0)` 和 `\t(\q0)`，程序不会据此断定纯绘图或不自动换行，因此保留左右 Margin；定位状态也不明确时，三个 Margin 均保留。
+
+程序只把对应事件字段写成 `0`，不会删除 ASS/SSA 的 CSV 字段。Margin 清理位于文本标签清理之后、连续相同行合并之前，因此字段归零后完全相同的行仍可继续合并。审计报告会逐项记录字段变化，例如 `MarginV: 0160 → 0`。仅修改 Comment 时会写入报告，但不会产生真实渲染差分的比较帧范围。
 
 ## 连续相同行合并
 
@@ -703,7 +777,8 @@ Aegisub Extradata 是可供自动化脚本使用的通用事件附加数据，�
 - 实际删除的两端未知标签
 - 两端均不识别的标签
 - 渲染器特有语法
-- 每个修改事件的清理前后文本
+- Text 字段改变时的清理前后文本
+- Margin 等事件字段的修改明细
 - 该事件实际删除的标签
 - 数值规范化与重排数量
 
@@ -777,6 +852,7 @@ libass ↔ xy-VSFilter
   "in_place": false,
   "safe_reorder": true,
   "merge_lines": true,
+  "clean_pos_margins": true,
   "clean_comments": false,
   "clean_unknown_tags": true,
   "clean_extradata_references": true,
@@ -817,14 +893,15 @@ python ass_clean_redundant_tags.py clean --settings settings.json
 | `recursive` | 是否递归扫描输入目录 |
 | `safe_reorder` | 是否执行兼容安全重排 |
 | `merge_lines` | 是否合并连续相同的静态 Dialogue |
+| `clean_pos_margins` | 是否清理合法 `\pos` Dialogue 与 Comment 中能够证明无效的事件 Margin；默认 `true` |
 | `clean_comments` | 是否删除 `[Events]` 中的 Comment 事件行；默认 `false` |
 | `remove_transparent_dialogues` | 是否在不影响碰撞布局时删除始终透明的 Dialogue 行；默认 `false` |
-| `clean_unknown_tags` | 是否删除 libass 与 xy‑VSFilter 均不识别的标签；默认 `true` |
+| `clean_unknown_tags` | 是否删除已证明无效的未知或畸形 override 标签；默认 `true` |
 | `clean_extradata_references` | 是否删除事件开头的 extradata 引用 |
 | `clean_project_garbage` | 是否删除 `[Aegisub Project Garbage]` |
 | `clean_extradata` | 是否删除 `[Aegisub Extradata]` 及关联引用 |
 | `report` | 单文件报告路径；不使用时为 `null` |
-| `report_dir` | 批量报告目录；示例使用相对路径 `cleanoutput` |
+| `report_dir` | 批量报告目录；相对路径与 `output_dir` 使用相同的输入相对规则 |
 | `write_reports` | 是否为每个输入生成报告 |
 | `report_format` | 批量报告格式：`md` 或 `html` |
 | `compare_libass` | 是否在清理后使用 libass 对比 |
@@ -842,7 +919,7 @@ python ass_clean_redundant_tags.py clean --settings settings.json
 
 命令行中明确提供的输入会整体替换 JSON 的 `inputs`。`--output`、`--output-dir`、`--report` 和 `--report-dir` 会覆盖 JSON 中对应的路径选择；其他命令行参数分别覆盖同名 JSON 字段。布尔选项可以使用对应的 `--no-*` 写法临时关闭，例如 `--no-safe-reorder`、`--no-merge-lines` 和 `--no-compare-libass`。
 
-JSON 中工具和报告的相对路径以运行命令时的当前目录为基准，因此示例使用当前目录下的 `cleanoutput` 作为报告根目录；相对 `output_dir` 则遵循前文的输入相对规则。清理后的字幕会写到单独字幕旁或所选文件夹内的 `cleanoutput` 文件夹，并保留扫描得到的子目录结构。`output`、`output_dir` 与 `in_place: true` 不能同时生效；`report` 与 `report_dir` 也不能同时设置。
+相对 `output_dir` 与 `report_dir` 使用相同的输入相对规则。两者都设为 `cleanoutput` 时，清理后的字幕与报告会一起写入单独字幕旁或所选输入文件夹内的 `cleanoutput`，并保留扫描得到的子目录结构。相对的单文件 `output`/`report` 路径及外部工具路径仍以运行命令时的当前目录为基准。`output`、`output_dir` 与 `in_place: true` 不能同时生效；`report` 与 `report_dir` 也不能同时设置。
 
 把命令行和 JSON 合并后的有效设置保存为新文件：
 

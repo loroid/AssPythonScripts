@@ -6,7 +6,7 @@
 
 [View script](ass_clean_redundant_tags.py)
 
-Cleans ASS/SSA override tags that do not change the effective state, writes that are completely superseded before any text is rendered, and insignificant numeric formatting. It can optionally remove collision-safe Dialogue rows that remain fully transparent, apply compatibility-safe tag reordering, merge consecutive identical static Dialogue rows, clean Aegisub file-level metadata, generate audit reports, and validate the before/after output independently with libass and xy-VSFilter.
+Cleans ASS/SSA override tags that do not change the effective state, writes that are completely superseded before any text is rendered, insignificant numeric formatting, and event margins proven inert under `\pos`. It can optionally remove collision-safe Dialogue rows that remain fully transparent, apply compatibility-safe tag reordering, merge consecutive identical static Dialogue rows, clean Aegisub file-level metadata, generate audit reports, and validate the before/after output independently with libass and xy-VSFilter.
 
 > **Scope:** Supports single files, multiple files, and directory batches. The safety target is to preserve the effective tag state of libass and xy-VSFilter independently. The two renderers are not expected to produce identical images, and syntax that cannot be proven safe is retained.
 
@@ -45,7 +45,7 @@ python ass_clean_redundant_tags.py
 1. Run the script without arguments to open the GUI. When arguments are supplied, cleanup is the default command; `clean` may also be written explicitly.
 2. Add one or more ASS/SSA files or directories, and enable recursive scanning if needed.
 3. Choose a separate output, an output directory, or in-place replacement.
-4. Select tag reordering, line merging, Comment-row removal, always-transparent Dialogue-row removal, unknown-tag cleanup, and Aegisub metadata cleanup as needed.
+4. Select tag reordering, positioned-margin cleanup, line merging, Comment-row removal, always-transparent Dialogue-row removal, unknown-tag cleanup, and Aegisub metadata cleanup as needed.
 5. Select Markdown or HTML when an audit report is required.
 6. Enable libass, xy-VSFilter, or both for actual rendering validation, and set the render concurrency limit.
 
@@ -68,9 +68,10 @@ python ass_clean_redundant_tags.py [clean] <input files or directories> [options
 | Replace source files | `--in-place`; add `--no-backup` to disable backups |
 | Compatibility-safe reorder | `--safe-reorder` |
 | Merge consecutive identical rows | `--merge-lines` |
+| Clear ineffective margins on positioned rows | `--clean-pos-margins`; enabled by default |
 | Remove Comment event rows | `--clean-comments`; disabled by default |
 | Remove always-transparent Dialogue rows | `--remove-transparent-dialogues`; disabled by default |
-| Remove tags unknown to both renderers | `--clean-unknown-tags` |
+| Remove proven-ineffective unknown or malformed tags | `--clean-unknown-tags` |
 | Remove extradata references | `--clean-extradata-references` |
 | Remove Project Garbage | `--clean-project-garbage` |
 | Remove the Extradata section | `--clean-extradata` |
@@ -133,9 +134,10 @@ The GUI provides independent controls for:
 - An absolute or relative output directory
 - Compatibility-safe tag reordering
 - Merging consecutive identical static Dialogue rows
+- Clearing ineffective event margins on safely analyzable `\pos` Dialogue and Comment rows
 - Removing Comment event rows from `[Events]`
 - Removing collision-safe Dialogue rows that remain fully transparent
-- Removing override tags unknown to both libass and xy-VSFilter
+- Removing proven-ineffective unknown or malformed override tags
 - Removing leading `{=number}` extradata references
 - Removing `[Aegisub Project Garbage]`
 - Removing `[Aegisub Extradata]`
@@ -214,7 +216,7 @@ A relative output directory does not depend on the process working directory. It
 
 ### Cleanup-option examples
 
-Compatibility-safe reordering, consecutive-line merging, removal of override tags unknown to both renderers, HTML reports, all three Aegisub metadata cleanup operations, and libass comparison are enabled by default. Comment-row removal, always-transparent Dialogue-row removal, and xy-VSFilter comparison are disabled by default:
+Compatibility-safe reordering, consecutive-line merging, removal of proven-ineffective unknown or malformed override tags, HTML reports, all three Aegisub metadata cleanup operations, and libass comparison are enabled by default. Comment-row removal, always-transparent Dialogue-row removal, and xy-VSFilter comparison are disabled by default:
 
 ```powershell
 python ass_clean_redundant_tags.py clean "input.ass"
@@ -222,7 +224,7 @@ python ass_clean_redundant_tags.py clean "input.ass"
 
 Every default-enabled option has a corresponding `--no-*` form. Add `--compare-vsfilter` when xy-VSFilter validation is required.
 
-Remove tags unknown to both target renderers:
+Remove proven-ineffective unknown or malformed override tags:
 
 ```powershell
 python ass_clean_redundant_tags.py clean "input.ass" `
@@ -261,11 +263,12 @@ The program tracks effective state from the initial Style and the order in which
 | Entire Dialogue row always transparent | The complete Dialogue event | `remove_transparent_dialogues` is enabled, all four channels are provably `&HFF&` at every rendered text/drawing span, no alpha transform can restore visibility, and deleting the event cannot alter collision placement | The option is disabled, any span can become visible, syntax is opaque, or an unpositioned same-layer collision group also contains a visible event |
 | First-wins line property | `\pos`/`\move`, `\org`, `\fad`/`\fade`, `\an`/`\a` | A later valid tag belongs to a family whose first valid occurrence already determines the line; a first alignment equal to Style can also disappear | The first effective geometry/fade tag remains; malformed forms create a conservative boundary |
 | Repeated Style reset | `\r`, `\rStyleName` | The same reset target repeats before text and the later reset changes no effective field | The reset selects a different Style, clears intervening changes, or occurs after rendered text |
-| Identity, repeated-target, or temporally inactive transform | `\t(...)` | All parsed modifiers leave their fields unchanged, a later explicit transform starts after the same target has settled, a deterministic static/reset write already supplies that target, the modifier list becomes empty, or the transform starts at/after the event end | The target differs, intervals overlap, times run backward, an intervening write changes the field, or the syntax cannot be fully parsed |
+| Repeated-target or temporally inactive transform | `\t(...)` | A supported instantaneous write repeats a settled target; a constant-result or future-time proof makes a modifier redundant; event-wide layout flags must remain | Nonzero-duration same-value interpolation without a native constant-result proof, dynamic/unknown starting state, different targets, unresolved overlap/backward times, or removal of the last unpositioned transform |
 | Unknown to both target renderers | Unknown override tags, including safely separable modifiers inside `\t` | `clean_unknown_tags` is enabled and the token is confirmed outside both compatibility sets | Either renderer supports it, or its syntax/location cannot be isolated safely |
 | Karaoke timing | `\k`, `\K`, `\kf`, `\ko`, `\kt` | Not removed merely because the numeric value looks ineffective | Preserved as timing/interpretation state; values may still be normalized and tags may be compatibility-safely reordered |
 | Clip and drawing data | `\clip`, `\iclip`, `\p` drawing paths | Redundant numeric zeroes and drawing token spelling are normalized; an unused clip is not deleted solely from geometry guesses | Clip semantics or drawing visibility cannot be proved from static field equality |
-| Override blocks emptied by cleanup or adjacent override blocks | `{\redundant}`, `{\tag1}{\tag2}` | A block is removed after all of its override tags are deleted; adjacent parseable blocks are merged when no conservative boundary lies between them | Literal comments, malformed content, renderer-specific HTML state, or other opaque content keeps the block or boundary |
+| Event margins with `\pos` | `MarginL`, `MarginR`, `MarginV` on Dialogue and Comment rows | `MarginV` is inert with an effective `\pos`; left and right margins are also inert with final `WrapStyle=2` or provably pure drawing content | Ordinary wrapped text under `WrapStyle=0/1/3`, `\move`, non-empty Effect, malformed or ambiguous syntax |
+| Override blocks emptied by cleanup or adjacent override blocks | `{\redundant}`, `{\tag1}{\tag2}` | Empty blocks without a required rendering boundary are removed; adjacent parseable blocks with no intervening content can merge | Between two nonempty spans, an emptied block remains as `{}` to preserve drawing objects and text shaping; comments and uncertain syntax also retain boundaries |
 
 “Removed” in this table always means that libass and xy-VSFilter keep their respective effective tag state. It does not mean that every textual duplicate is deleted.
 
@@ -301,9 +304,53 @@ becomes:
 Example
 ```
 
+### Deletion scope, bare tags, and relative font sizes
+
+Cleanup combines forward state propagation with backward read/write analysis. A later complete assignment can remove an earlier group, including a relative operation or a malformed setter, before any text reads it. Analysis restarts after a change and stops at a fixed point; it does not use a fixed number of cleanup rounds.
+
+`clean_unknown_tags` also controls proven-ineffective malformed known tags. It does **not** mean “delete anything that fails parsing.” When disabled, malformed tokens and connected writes to the same fields are protected; unrelated fields can still be cleaned. Legal bare tags and relative `\fs` are independent of this option. With Style font size `24`, outline `2`, and spacing `0`:
+
+| Input | Option enabled | Option disabled |
+| --- | --- | --- |
+| `{\bord4\bordgarbage\bord4}X` | `{\bord4}X` | unchanged |
+| `{\fs40\fsbad\fs40}X` | `{\fs40}X` | unchanged |
+| `{\fsp5}{\fsp}{\fsp5}X` | `{\fsp5}X` | `{\fsp5}X` |
+| `{\fs40\fs+10\fs40}X` | `{\fs40}X` | `{\fs40}X` |
+
+Bare forms are categorized individually, including empty parentheses, use inside transforms, and named resets:
+
+| Family | Empty-argument behavior / dependency |
+| --- | --- |
+| Font, scale, spacing, Z rotation, border/shadow, color/alpha, font flags/encoding | Native Style fallback; libass uses the active reset Style, while xy-VSFilter uses the event's original Style |
+| `\frx`, `\fry`, `\fax`, `\fay`, `\blur`, `\be`, `\p`, `\pbo` | Fixed zero fallback |
+| `\q` | Script Info `WrapStyle` fallback |
+| `\an`, `\a` | Alignment fallback plus first-wins state |
+| `\r` | Original event Style reset, including cancellation of preceding animated field state |
+| `\k`, `\K`, `\kf`, `\ko`; `\kt` | Karaoke timeline effects; bare duration is 100 cs, or zero for `\kt` |
+| Position/origin, fade, clip, and `\t` | Dedicated argument parsing and structural/layout effects; not treated as empty no-ops |
+
+For example, after `\rAlt`, a bare `\fs` need not produce the same size in both renderers. The cleaner tracks the two fallback states separately.
+
+An immediate sign in `\fs+n` or `\fs-n` applies a factor `1+n/10` or `1-n/10` to the current size. Other numeric tags do not use this formula. `\fs +1` is not the relative spelling `\fs+1`; the separating whitespace is preserved.
+
+By default optimization deletes existing writes rather than inventing replacement tags. One exception allows a static chain of at least two font-size writes to become one existing absolute `\fs`, when both native operation orders produce the same positive integer. Intermediate values are never rounded:
+
+| Chain | Result |
+| --- | --- |
+| `\fs40\fs+1` | `\fs44` |
+| `\fs40\fs-1` | `\fs36` |
+| `\fs40\fs+10` | `\fs80` |
+| `\fs33\fs+1` | Retain the fractional-result chain |
+| `\fs40\fs+1\fs-1` | `\fs44\fs-1`; only the integer prefix folds, and the final result remains 39.6 |
+| `\fs33\fs+1\fs40` | `\fs40` by complete overwrite |
+
+These examples assume the initial size differs from the required final size. If the entire chain restores the already effective state, deleting it is preferred. Chains do not fold across rendered content, resets, relevant animation, or unknown writes. Reports count integer-size folding separately from the actual number of tags deleted.
+
+Rendering equivalence, a modeled cleanup fixed point, and minimality are separate results. Native frame PASS and idempotence alone do not prove minimality. Development audits enumerate permitted tag/modifier deletion subsets and integer-font candidates; unsupported syntax without a proof remains **minimality unproven**, not “fully minimized.” Necessary `{}` boundaries and animation/collision effects are never counted as redundant tags.
+
 ### Complex state examples
 
-The following examples assume that Style `Default` has `ScaleX=100`, a white primary color, primary alpha `&H80&`, `Outline=2`, and `Shadow=0`. Style `Alt` has `ScaleX=80`, `ScaleY=100`, bold enabled, primary color `&HFF0000&`, `Outline=3`, and `Shadow=1`.
+The following examples assume that Style `Default` has `ScaleX=100`, a white primary color, primary alpha `&H80&`, `Outline=2`, and `Shadow=0`. Style `Alt` has `Fontsize=40`, `ScaleX=80`, `ScaleY=100`, bold enabled, primary color `&HFF0000&`, `Outline=3`, and `Shadow=1`.
 
 Dead writes, Style-equivalent tags, first-wins geometry, and decimal formatting may occur before the same rendering boundary:
 
@@ -348,6 +395,8 @@ the result is:
 The first `\blur200` and `\fscx60` affect already rendered text and cannot be removed because the same value appears later. Both resets are also required because they select the Style used by `C` and `D`. Only writes that truly have no remaining effect in the current state are removed.
 
 ### Fully transparent color channels
+
+Secondary color/alpha writes (`\2c`, `\2a`) can also be removed when no karaoke timeline can read them. A global `\alpha` is removed only when all of its channel writes are either unobservable or overwritten before use; the program does not replace it with newly synthesized channel tags. Entirely hidden content may shed paint fields, while font/geometry fields also require independent placement before their collision effects can be disregarded.
 
 A `\c` / `\1c`–`\4c` write is removed when its corresponding `\alpha` or `\1a`–`\4a` channel is provably `&HFF&` for the write's complete lifetime. The analysis follows later text, channel-alpha overrides, replacement colors, and `\r` instead of looking only inside one override block. For example:
 
@@ -425,26 +474,30 @@ Brace comments, malformed arguments, unparseable blocks, and renderer-specific H
 
 ### Tags unknown to both renderers
 
-Removal of override tags unknown to both renderers is enabled by default. Use `--no-clean-unknown-tags` to retain them:
+Removal of proven-ineffective unknown or malformed override tokens is enabled by default. Use `--no-clean-unknown-tags` to retain those tokens and their related field writes:
 
 ```ass
 {\zunknown1\fs60}Text  →  {\fs60}Text
 ```
 
-Unknown tags inside a simple `\t(...)` modifier are also removed. If that leaves no effective modifier, the empty transform is removed as well.
+Unknown tags inside a simple `\t(...)` modifier can also be removed. If that leaves an empty transform, its event-wide animation and collision effects are still checked before deleting it.
 
 This option does not remove:
 
-- A tag supported by either libass or xy-VSFilter
-- A malformed argument following a known tag name
+- An effective tag supported by either libass or xy-VSFilter
+- A malformed known setter whose effect is not proven dead or redundant
 - Backslash-like text inside a block known to be a brace comment
 - Content inside a complex transform that cannot be split safely
 
-ASS tag names have no independent terminator. If a raw token begins with a known short tag, it is retained as that known tag with a malformed suffix. For example, `\unknown` begins with valid `\u`, so it is not deleted solely because more letters follow. This deliberately removes less in order to avoid deleting a token that either target renderer may partially parse.
+ASS tag names have no independent terminator. A token beginning with a known short tag is analyzed as that setter, not as an inert unknown name. For example, `\unknown` begins with `\u` and is not removed merely because more letters follow. A later complete overwrite may still prove it unnecessary.
+
+An unknown outer tag containing backslashes, such as `\z(abc(\b1)\i1)`, is normally retained because a renderer may execute an inner tag. A narrowly recognized inner flag group can be removed only when execution and native Style fallback are both proven no-ops. Unbalanced or otherwise unmodeled syntax remains protected. Verified simple scalar prefixes can establish native values without rewriting their malformed spelling; other uncertain setters invalidate affected values. Color/alpha parameters with leading whitespace, such as `\c &HFF&`, are not treated as their whitespace-free equivalents. Numeric normalization never rounds a long decimal coefficient or silently strips unverified Unicode whitespace.
 
 “Unknown to both” refers only to the libass and xy-VSFilter compatibility sets maintained by this program. Other renderers, Aegisub automation scripts, or future versions may use extension tags. Disable this option when such tags must be preserved. Reports distinguish unknown tags actually removed from unknown tokens retained conservatively.
 
 ## Numeric and drawing normalization
+
+Numeric syntax uses ASCII digits. Fullwidth/Arabic digits and unverified Unicode whitespace are not converted into valid parameters. Unicode separators inside event text remain text, not ASS line endings; ambiguous Style numbers or Script Info `WrapStyle` do not establish known cleanup state.
 
 Leading zeros, redundant decimal points, and trailing zeros that do not change a value are removed:
 
@@ -462,6 +515,8 @@ Normalization covers:
 - `\p` drawing coordinates
 - Drawing paths inside vector clips
 
+`\be` retains its fractional value: `\be1.600` becomes `\be1.6`, never `\be1`. This also applies inside transforms, where changing the target before interpolation can change rendering. Nonstandard bold/italic/underline/strikeout values are analyzed using their Style fallback rather than treating every nonzero value as enabled.
+
 Adjacent drawing commands are converted to standard space-separated form:
 
 ```ass
@@ -474,32 +529,32 @@ becomes:
 m 100 100 l 200 200
 ```
 
-Fragments containing unknown drawing tokens, indeterminate `\p` arguments, or complex nested expressions are retained unchanged.
+Fragments containing unknown drawing tokens, uppercase drawing commands, comma-separated coordinates, indeterminate `\p` arguments, or complex nested expressions are retained unchanged rather than converted into potentially different geometry.
 
 ## Transform safety boundaries
 
 Simple `\t` expressions are analyzed field by field:
 
-- Identity transforms can be removed
-- In a monotonic non-overlapping sequence, a later transform that repeats an already-settled target can be removed; both zero-duration and non-zero-duration intervals are supported
-- A valid transform entirely after the event end can be removed
+- A same-value target alone is insufficient: interpolation, integer quantization, animation flags, and collision layout can still change output
+- A supported later instantaneous transform at a nonzero time can be removed when its target is already settled and no intervening write changes it
+- Empty transforms and supported interpolation entirely after the event end can be removed only when their event-wide effects are also preserved
 - Fields modified by a transform protect static state that actually changes the animation start; a preceding write equal to the current effective state can still be removed
 - Static redundant tags unrelated to transform fields can still be removed independently
-- Nested transforms, complex parenthesized content, and relative font-size animation are not semantically deleted field by field; independently recognizable numbers are still normalized, and unknown modifiers are removed only when `--clean-unknown-tags` is enabled and the content can be split safely
+- Nested transforms and complex parenthesized content are not semantically decomposed. Relative font-size animation is retained unless a dedicated no-op or complete-overwrite proof applies; for example, a proven `\fs+0` modifier can be removed. Independently recognizable numbers are still normalized, and unknown modifiers are removed only when `--clean-unknown-tags` is enabled and the content can be split safely
 
-Assume the active Style has `ScaleX=100` and `ScaleY=100`. If a transform still targets the current value of 100, the effective value never changes before, during, or after interpolation, so the entire identity transform can be removed:
+The last original transform is retained on an unpositioned event to preserve animation/collision behavior. Even `\t()` can change the placement of overlapping events. An empty transform on an unambiguously positioned event can be removed:
 
 ```ass
-{\t(0,500,\fscx100)}Text
+{\pos(100,100)\t()}Text
 ```
 
 This becomes:
 
 ```ass
-Text
+{\pos(100,100)}Text
 ```
 
-`\fscy100` is unrelated to the following transform and can also be removed:
+Assume the active Style has `ScaleX=100` and `ScaleY=100`. `\fscy100` is unrelated to the following transform and can be removed:
 
 ```ass
 {\fscy100\t(\fscx200)}Text
@@ -535,7 +590,9 @@ This becomes:
 {\1a&HFF&\t(42,42,\1a&HCC&)\t(83,83,\1a&H9A&)\t(250,250,\1a&H00&)}Text
 ```
 
-This timeline proof accepts fully parsed absolute modifiers with explicit start/end times. A target becomes settled at the end of its interval; a later non-overlapping transform to the same value is redundant whether either interval has zero or non-zero duration. A deterministic static/reset write also establishes a fresh target, so a later transform to that same value can be removed. A different target, overlapping interval, or backward timestamp is retained because it changes output. Once every retained interval has ended, its final target can still prove a later repetition redundant; only opaque modifiers stop further proof for the affected fields. Transforms on unrelated fields do not block the proof. Discrete and compatibility modifiers such as font name, bold, italic, underline, strikeout, encoding, and `\fsc` follow the same rule after independent libass and xy-VSFilter differential checks.
+This timeline proof accepts fully parsed absolute numeric/color/alpha modifiers with explicit start/end times. Only a later instantaneous interval with equal, nonzero start/end times is deleted as a repeated target. Nonzero-duration repetitions require a separate interpolation/quantization proof; mathematical equality alone is insufficient. End time `0` means the event duration, so `\t(0,0,...)` is not instantaneous. Font names, bold, italic, underline, strikeout, encoding, `\be`, and the immediate compatibility reset `\fsc` do not participate in this timeline deletion proof. Returning to a Style value after an earlier animation is a real change; a reset after a transform also remains when it cancels animated state.
+
+Separate constant-result proofs cover exact binary interpolation (using libass's actual scale units) and stable native `\be` quantization. For example, `{\fs32\t(0,333,\fs32)}Text` becomes `{\fs32\t(0,333,)}Text`; the last transform still carries layout flags. An ineffective future modifier can likewise be removed while retaining its parent: with duration `1000 ms`, `{\t(1000,2000,\fscx200)}Text` becomes `{\t(1000,2000,)}Text`. Unknown or non-finite starting values do not qualify for that future-time proof.
 
 ### Complex transform examples
 
@@ -562,10 +619,10 @@ A parseable transform may coexist with a complex one. Assume an event duration o
 This becomes:
 
 ```ass
-{\rAlt\t(0,500,\fs+10\fscy150)\shad1}A
+{\rAlt\t(0,500,\fs+10\fscy150)}A
 ```
 
-The first transform begins at the event end and cannot affect an active frame, so it is removed. The second uses relative `\fs+10`, which depends on the current font size. The preceding `\fs40`, `\fscx80`, `\fscy100`, and `\bord3` equal Style `Alt` and can be removed without changing the animation start. The `\shad1` after the complex transform remains inside a conservative boundary and is retained.
+The first transform begins at the event end and cannot affect an active frame, so it is removed. The second uses relative `\fs+10`, which depends on the current font size. The preceding `\fs40`, `\fscx80`, `\fscy100`, and `\bord3` equal Style `Alt` and can be removed without changing the animation start. The independent `\shad1` also equals Style `Alt` and is removed.
 
 ## Compatibility-safe reordering
 
@@ -590,7 +647,7 @@ Reordering is enabled by default and uses this stable partial order:
 This is not an unconditional sort. Two adjacent tags can exchange positions only when all of the following are true:
 
 - Both tags are fully parseable by libass and xy-VSFilter
-- Their complete read/write field sets do not intersect
+- Their complete read/write field sets are independent, or simulating both orders proves an overlapping deterministic write equivalent
 - First-wins, reset, drawing, karaoke-timeline, and transform dependencies remain intact
 - They do not cross a retained unknown tag, brace comment, malformed argument, or complex expression
 - `\clip` / `\iclip` cross a simple transform only when its parsed modifier fields do not include clipping; duplicate clip-family tags are not reordered
@@ -606,14 +663,31 @@ The undocumented `\fsc` compatibility reset never crosses `\r`: xy-VSFilter prod
 For example:
 
 ```ass
-{\fnExampleFont\an4\fs26\c&H000000&\blur1.5\1a&H78&\pos(119.66,201.29)}
+{\fnExampleFont\an4\fs26\c&H000000&\blur1.5\1a&H78&\pos(119.66,201.29)}Text
 ```
 
 with a black primary color in the active Style can become:
 
 ```ass
-{\an4\pos(119.66,201.29)\fnExampleFont\fs26\1a&H78&\blur1.5}
+{\an4\fnExampleFont\fs26\1a&H78&\blur1.5\pos(119.66,201.29)}Text
 ```
+
+## Positioned event-margin cleanup
+
+`clean_pos_margins` is enabled by default and can be disabled with `--no-clean-pos-margins`. It processes both Dialogue and Comment events. Comment rows use the same conservative rules so their layout is preserved if they are later converted back to Dialogue.
+
+The program first resolves the first effective position-family tag. Cleanup proceeds only when that tag is a valid `\pos`; `\move`, malformed position syntax, a non-empty Effect field, and ambiguous override structure leave every Margin unchanged.
+
+For a safely positioned event:
+
+- `MarginV` is set to `0`.
+- `MarginL` and `MarginR` are set to `0` only when the final effective wrap mode is `2`, or every renderable span is provably in `\p>0` drawing mode.
+- The wrap mode starts at `[Script Info]` `WrapStyle` and follows the last strict `\q0`–`\q3`. Ambiguous or malformed `\q` syntax keeps the horizontal margins.
+- Ordinary text under wrap modes `0`, `1`, and `3` keeps its horizontal margins because they can still change automatic line wrapping.
+
+Nested or uncertain writes to drawing/wrap state, including `\t(\p0)` and `\t(\q0)`, prevent a pure-drawing/no-wrap proof. Horizontal margins remain in that situation; uncertain positioning preserves every margin.
+
+Only the event-field values are rewritten; ASS/SSA CSV fields are not removed. Margin cleanup runs after text/tag cleanup and before consecutive-line merging, so rows that become fully identical can then be merged. Audit reports list each changed field, for example `MarginV: 0160 → 0`. Comment-only changes are recorded in the report but do not create actual-rendering comparison frame ranges.
 
 ## Consecutive identical-line merging
 
@@ -697,7 +771,8 @@ Reports include only events that were actually modified. Unchanged rows and tags
 - Tags unknown to both renderers that were actually removed
 - Tokens unknown to both renderers that were retained conservatively
 - Renderer-specific syntax
-- Before/after text for every modified event
+- Before/after text when an event's Text field changed
+- Event-field changes such as cleared Margin values
 - Tags actually removed from each event
 - Numeric-normalization and reorder counts
 
@@ -771,6 +846,7 @@ Inputs remain blank in the example; relative subtitle-output and report folders 
   "in_place": false,
   "safe_reorder": true,
   "merge_lines": true,
+  "clean_pos_margins": true,
   "clean_comments": false,
   "clean_unknown_tags": true,
   "clean_extradata_references": true,
@@ -811,14 +887,15 @@ python ass_clean_redundant_tags.py clean --settings settings.json
 | `recursive` | Recursively scan input directories |
 | `safe_reorder` | Apply compatibility-safe reordering |
 | `merge_lines` | Merge consecutive identical static Dialogue rows |
+| `clean_pos_margins` | Clear event margins proven ineffective on valid `\pos` Dialogue and Comment rows; default: `true` |
 | `clean_comments` | Remove Comment event rows from `[Events]`; default: `false` |
 | `remove_transparent_dialogues` | Remove always-transparent Dialogue rows when collision-safe; default: `false` |
-| `clean_unknown_tags` | Remove tags unknown to both libass and xy-VSFilter; default: `true` |
+| `clean_unknown_tags` | Remove proven-ineffective unknown or malformed override tags; default: `true` |
 | `clean_extradata_references` | Remove leading event extradata references |
 | `clean_project_garbage` | Remove `[Aegisub Project Garbage]` |
 | `clean_extradata` | Remove `[Aegisub Extradata]` and associated references |
 | `report` | Single-file report path; `null` when unused |
-| `report_dir` | Batch report directory; the example uses the relative `cleanoutput` folder |
+| `report_dir` | Batch report directory; relative paths follow the same input-relative rule as `output_dir` |
 | `write_reports` | Generate one report for every input |
 | `report_format` | Batch report format: `md` or `html` |
 | `compare_libass` | Compare with libass after cleanup |
@@ -836,7 +913,7 @@ python ass_clean_redundant_tags.py clean --settings settings.json
 
 Explicit command-line inputs replace JSON `inputs` as a group. `--output`, `--output-dir`, `--report`, and `--report-dir` override the corresponding path choices in JSON. Other command-line arguments override matching JSON fields individually. Boolean options have `--no-*` forms for temporary overrides, such as `--no-safe-reorder`, `--no-merge-lines`, and `--no-compare-libass`.
 
-Relative tool and report paths in JSON are resolved from the current directory in which the command runs, so the example uses `cleanoutput` there as its report root. A relative `output_dir` follows the input-relative rules described above, so cleaned subtitles go under a `cleanoutput` folder beside each individually selected file or under each selected directory while preserving scanned subdirectories. `output`, `output_dir`, and `in_place: true` are mutually exclusive; `report` and `report_dir` are also mutually exclusive.
+Relative `output_dir` and `report_dir` use the same input-relative rules described above. With both set to `cleanoutput`, each cleaned subtitle and its report are written together under a `cleanoutput` folder beside an individually selected file or under the selected input directory, while preserving scanned subdirectories. Relative single-file `output`/`report` paths and external-tool paths are resolved from the current working directory. `output`, `output_dir`, and `in_place: true` are mutually exclusive; `report` and `report_dir` are also mutually exclusive.
 
 Save the effective settings produced by merging command-line arguments and JSON:
 

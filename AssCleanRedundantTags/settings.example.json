@@ -8,6 +8,7 @@
 
   "safe_reorder": true,
   "merge_lines": true,
+  "clean_pos_margins": true,
   "clean_comments": false,
   "remove_transparent_dialogues": false,
   "clean_unknown_tags": true,
